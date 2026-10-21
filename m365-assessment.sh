@@ -488,8 +488,17 @@ echo "Wrote $(($(wc -l < "$CA_CSV") - 1)) Conditional Access policy rows -> $CA_
 # --- Privileged directory role assignments ---
 echo "Collecting privileged role assignments..."
 ROLE_ASSIGNMENTS='[]'
-if ROLE_TRY=$(get_all_pages 'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$expand=principal($select=id,displayName,userPrincipalName,userType,accountEnabled),roleDefinition&$top=999'); then
-    ROLE_ASSIGNMENTS="$ROLE_TRY"
+# Graph only allows one $expand per request, so expand the principal here and
+# join role definitions (id -> displayName/templateId) from a separate call.
+if ROLE_TRY=$(get_all_pages 'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$expand=principal'); then
+    ROLE_DEFS=$(get_all_pages 'https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions') || {
+        echo "WARNING: could not read role definitions; role names will show as IDs." >&2
+        ROLE_DEFS='[]'
+    }
+    ROLE_ASSIGNMENTS=$(jq -c --slurpfile defs "$(jfile roledefs "$ROLE_DEFS")" '
+        ($defs[0] | map({(.id): {displayName, templateId}}) | add // {}) as $d |
+        map(. + {roleDefinition: ($d[.roleDefinitionId] // null)})
+    ' <<<"$ROLE_TRY")
     ROLES_AVAILABLE=1
 else
     echo "WARNING: could not read directory role assignments (requires RoleManagement.Read.Directory); skipping." >&2
