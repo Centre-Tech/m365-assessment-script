@@ -42,17 +42,19 @@ curl -s https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/
 | `M365_RiskyUsers_<tenant>_<ts>.csv`   | Microsoft Entra ID Protection risky users (requires Entra ID P2). |
 | `M365_SecureScore_<tenant>_<ts>.csv`  | Microsoft Secure Score, per control, worst-implemented first. |
 | `M365_SecurityFindings_<tenant>_<ts>.csv` | Consolidated High/Medium/Low findings synthesized across all of the above, sorted by severity. App consent findings are one row per third-party app (listing its high-risk permissions, admin consent and user-consent count); service principals holding Global Administrator are flagged separately from the human Global Admin count. |
+| `M365_E5ToBusinessPremium_<tenant>_<ts>.csv` | One row per Microsoft 365 E5 user with a `Recommendation`: **Keep E5** (mailbox over 50 GB, or custodian in an open eDiscovery case), **Review** (holds an admin role, mailbox 40–50 GB, or has a Windows Enterprise device), **Business Premium + add-ons** (Teams Phone Standard if they have a phone number or calling plan with Phone System only from E5; Power BI Pro if they used Power BI in the last 28 days; Entra ID P2 if PIM-eligible or covered by a risk-based Conditional Access policy), **Business Premium**, or **Remove license (inactive)**. If any check couldn't run, Business Premium recommendations get an **(unverified)** suffix. `Reasons` explains each call; `NotChecked` lists the data sources that couldn't be read. Run with `--extended` for full coverage. |
 
 ## Options
 
 | Flag | Default | Notes |
 | --- | --- | --- |
 | `--tenant ID\|DOMAIN`    | current session | Target tenant for the Graph token. Use when assessing a customer tenant via a partner (GDAP) account; run `az login --tenant <ID> --allow-no-subscriptions --use-device-code` first. If a GUID is given, the script aborts if Graph reports a different tenant. |
-| `--extended`             | off         | Adds a second device-code sign-in (Microsoft Graph Command Line Tools app) so Secure Score and risky users can be collected; the Cloud Shell Azure CLI token can't access them. The code prompt appears right after `Connected to:`; sign in once and the rest of the run is unattended. First use in a tenant needs a Global Admin to consent for the organization. |
+| `--extended`             | off         | Adds a second device-code sign-in (Microsoft Graph Command Line Tools app) for data the Cloud Shell Azure CLI token can't access: Secure Score, risky users, and for the E5 fit check, mailbox sizes, Teams phone numbers, PIM eligibility, eDiscovery custodians and Intune devices. The code prompt appears right after `Connected to:`; sign in once and the rest of the run is unattended. First use in a tenant (and after new permissions are added) needs a Global Admin to consent for the organization. |
 | `--stale-days N`         | `90`        | Inactivity threshold for the stale-users CSV. |
 | `--output-dir PATH`      | `$HOME`     | Where the CSVs / zip are written. |
 | `--skip-friendly-names`  | off         | Skip downloading Microsoft's SKU friendly-name map; CSV keeps raw `SkuPartNumber` values. |
 | `--skip-security-review` | off         | Skip the security review entirely and only produce the original Users/Products/StaleUsers CSVs. |
+| `--skip-e5-fit`          | off         | Skip the per-user Microsoft 365 E5 → Business Premium fit check. |
 | `--legacy-auth-days N`   | `7`         | Sign-in log lookback window for the legacy-auth scan. |
 | `--no-download`          | off         | Don't auto-trigger the Cloud Shell download dialog; just print the zip path. |
 
