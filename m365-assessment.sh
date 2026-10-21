@@ -23,11 +23,14 @@ SKIP_SECURITY=0
 LEGACY_AUTH_DAYS=7
 TENANT=""
 MAX_RETRIES=6
+EXTENDED=0
 
 usage() {
     cat <<EOF
 Usage: $0 [options]
   --tenant ID|DOMAIN       Target tenant (default: the tenant of the current Azure CLI session)
+  --extended               Second (device-code) sign-in to collect Secure Score and risky users,
+                           which the Cloud Shell Azure CLI token can't access
   --stale-days N           Stale account threshold in days (default 90)
   --output-dir PATH        Output directory (default: \$HOME)
   --skip-friendly-names    Skip downloading Microsoft's SKU friendly-name map
@@ -41,6 +44,7 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --tenant)              TENANT="$2"; shift 2 ;;
+        --extended)            EXTENDED=1; shift ;;
         --stale-days)          STALE_DAYS="$2"; shift 2 ;;
         --output-dir)          OUTPUT_DIR="$2"; shift 2 ;;
         --skip-friendly-names) SKIP_FRIENDLY=1; shift ;;
@@ -83,6 +87,69 @@ jfile() {
 TOKEN_FILE="$WORK/token"
 TOKEN_EXP_FILE="$WORK/token_exp"
 
+# --extended: the Azure CLI token Cloud Shell hands out can never carry
+# SecurityEvents.Read.All or IdentityRiskyUser.Read.All, so Secure Score and
+# risky users need a second token. It comes from an OAuth device-code sign-in
+# against Microsoft's "Microsoft Graph Command Line Tools" public client and is
+# used only for those calls (GRAPH_AUTH_MODE=ext).
+GRAPH_AUTH_MODE=cli
+EXT_CLIENT_ID='14d82eec-204b-4c2f-b7e8-296a70dab67e'
+EXT_SCOPES='https://graph.microsoft.com/SecurityEvents.Read.All https://graph.microsoft.com/IdentityRiskyUser.Read.All offline_access'
+EXT_TOKEN_FILE="$WORK/ext_token"
+EXT_EXP_FILE="$WORK/ext_token_exp"
+EXT_REFRESH_FILE="$WORK/ext_refresh"
+
+ext_store() {
+    jq -e -r '.access_token' <<<"$1" > "$EXT_TOKEN_FILE" || return 1
+    echo $(( $(date +%s) + $(jq -r '.expires_in // 3600' <<<"$1") )) > "$EXT_EXP_FILE"
+    jq -r '.refresh_token // empty' <<<"$1" > "$EXT_REFRESH_FILE"
+}
+
+ext_refresh() {
+    local rt resp
+    rt=$(cat "$EXT_REFRESH_FILE" 2>/dev/null || true)
+    [[ -n "$rt" ]] || return 1
+    resp=$(curl -s -X POST "https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token" \
+        --data-urlencode "grant_type=refresh_token" --data-urlencode "client_id=$EXT_CLIENT_ID" \
+        --data-urlencode "scope=$EXT_SCOPES" --data-urlencode "refresh_token=$rt") || return 1
+    ext_store "$resp"
+}
+
+ext_sign_in() {
+    local login="https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0" dc device_code interval deadline resp err
+    dc=$(curl -s -X POST "$login/devicecode" \
+        --data-urlencode "client_id=$EXT_CLIENT_ID" --data-urlencode "scope=$EXT_SCOPES") || return 1
+    device_code=$(jq -r '.device_code // empty' <<<"$dc" 2>/dev/null || true)
+    if [[ -z "$device_code" ]]; then
+        echo "  $(jq -r '.error_description // "device code request failed"' <<<"$dc" 2>/dev/null | head -n1)" >&2
+        return 1
+    fi
+    interval=$(jq -r '.interval // 5' <<<"$dc")
+    deadline=$(( $(date +%s) + $(jq -r '.expires_in // 900' <<<"$dc") ))
+    echo ""
+    echo ">>> $(jq -r '.message' <<<"$dc")"
+    echo ">>> Sign in as a Global Administrator of $TENANT_NAME. If asked, tick \"Consent on behalf of your organization\"."
+    echo ""
+    while (( $(date +%s) < deadline )); do
+        sleep "$interval"
+        resp=$(curl -s -X POST "$login/token" \
+            --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:device_code" \
+            --data-urlencode "client_id=$EXT_CLIENT_ID" --data-urlencode "device_code=$device_code") || continue
+        if jq -e '.access_token' >/dev/null 2>&1 <<<"$resp"; then
+            ext_store "$resp"
+            return
+        fi
+        err=$(jq -r '.error // empty' <<<"$resp" 2>/dev/null || true)
+        case "$err" in
+            authorization_pending) ;;
+            slow_down) interval=$((interval + 5)) ;;
+            *) echo "  $(jq -r '.error_description // .error // "sign-in failed"' <<<"$resp" 2>/dev/null | head -n1)" >&2; return 1 ;;
+        esac
+    done
+    echo "  The device code expired before sign-in completed." >&2
+    return 1
+}
+
 refresh_token() {
     local args=(account get-access-token --resource https://graph.microsoft.com -o json) out
     [[ -n "$TENANT" ]] && args+=(--tenant "$TENANT")
@@ -94,6 +161,14 @@ refresh_token() {
 auth_header() {
     local exp now
     now=$(date +%s)
+    if [[ "$GRAPH_AUTH_MODE" == ext ]]; then
+        exp=$(cat "$EXT_EXP_FILE" 2>/dev/null || echo 0)
+        if (( exp - now < 300 )); then
+            ext_refresh || true
+        fi
+        printf 'Authorization: Bearer %s' "$(cat "$EXT_TOKEN_FILE")"
+        return
+    fi
     exp=$(cat "$TOKEN_EXP_FILE" 2>/dev/null || true)
     # Older az versions don't return expires_on; assume a 45-minute lifetime.
     [[ "$exp" =~ ^[0-9]+$ ]] || exp=$(( $(stat -c %Y "$TOKEN_FILE") + 2700 ))
@@ -118,7 +193,11 @@ graph_get() {
             401)
                 (( refreshed == 0 )) || break
                 refreshed=1
-                refresh_token || break ;;
+                if [[ "$GRAPH_AUTH_MODE" == ext ]]; then
+                    ext_refresh || break
+                else
+                    refresh_token || break
+                fi ;;
             429|500|502|503|504|000)
                 (( attempt < MAX_RETRIES )) || break
                 wait=$(awk 'tolower($1)=="retry-after:" {print $2+0}' "$hdr" | tail -n1)
@@ -175,6 +254,17 @@ echo "Connected to: $TENANT_NAME  ($TENANT_ID)"
 if [[ "$TENANT" =~ ^[0-9a-fA-F-]{36}$ && "${TENANT,,}" != "${TENANT_ID,,}" ]]; then
     echo "ERROR: requested tenant $TENANT but Graph returned $TENANT_ID; aborting." >&2
     exit 1
+fi
+
+EXT_AVAILABLE=0
+if [[ $EXTENDED -eq 1 && $SKIP_SECURITY -ne 1 ]]; then
+    echo "Extended mode: second sign-in for Secure Score and Identity Protection..."
+    if ext_sign_in; then
+        EXT_AVAILABLE=1
+        echo "Extended sign-in complete; continuing unattended."
+    else
+        echo "WARNING: extended sign-in failed; Secure Score and risky users will use the Cloud Shell token (likely unavailable)." >&2
+    fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -488,8 +578,17 @@ echo "Wrote $(($(wc -l < "$CA_CSV") - 1)) Conditional Access policy rows -> $CA_
 # --- Privileged directory role assignments ---
 echo "Collecting privileged role assignments..."
 ROLE_ASSIGNMENTS='[]'
-if ROLE_TRY=$(get_all_pages 'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$expand=principal($select=id,displayName,userPrincipalName,userType,accountEnabled),roleDefinition&$top=999'); then
-    ROLE_ASSIGNMENTS="$ROLE_TRY"
+# Graph only allows one $expand per request, so expand the principal here and
+# join role definitions (id -> displayName/templateId) from a separate call.
+if ROLE_TRY=$(get_all_pages 'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$expand=principal'); then
+    ROLE_DEFS=$(get_all_pages 'https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions') || {
+        echo "WARNING: could not read role definitions; role names will show as IDs." >&2
+        ROLE_DEFS='[]'
+    }
+    ROLE_ASSIGNMENTS=$(jq -c --slurpfile defs "$(jfile roledefs "$ROLE_DEFS")" '
+        ($defs[0] | map({(.id): {displayName, templateId}}) | add // {}) as $d |
+        map(. + {roleDefinition: ($d[.roleDefinitionId] // null)})
+    ' <<<"$ROLE_TRY")
     ROLES_AVAILABLE=1
 else
     echo "WARNING: could not read directory role assignments (requires RoleManagement.Read.Directory); skipping." >&2
@@ -714,13 +813,19 @@ EXPIRED_CRED_APPS=$(jq -c --slurpfile sp "$SP_FILE" --argjson now "$NOW_EPOCH" "
 rm -f "$SP_FILE" "$DEL_FILE" "$APPASSIGN_FILE"
 
 # --- Identity Protection risky users ---
+EXT_HINT=""
+[[ $EXT_AVAILABLE -eq 1 ]] || EXT_HINT=" Re-run with --extended to collect it."
+if [[ $EXT_AVAILABLE -eq 1 ]]; then
+    GRAPH_AUTH_MODE=ext
+fi
+
 echo "Collecting Identity Protection risky users..."
 RISKY_USERS='[]'
 if RISKY_TRY=$(get_all_pages 'https://graph.microsoft.com/v1.0/identityProtection/riskyUsers?$top=500'); then
     RISKY_USERS="$RISKY_TRY"
     RISKYUSERS_AVAILABLE=1
 else
-    echo "WARNING: could not read Identity Protection risky users (requires Entra ID P2 + IdentityRiskyUser.Read.All); skipping." >&2
+    echo "WARNING: could not read Identity Protection risky users (requires Entra ID P2 + IdentityRiskyUser.Read.All); skipping.${EXT_HINT}" >&2
 fi
 
 jq -r '
@@ -737,7 +842,7 @@ if SS_TRY=$(get_all_pages 'https://graph.microsoft.com/v1.0/security/secureScore
     SECURE_SCORE_ALL="$SS_TRY"
     SECURESCORE_AVAILABLE=1
 else
-    echo "WARNING: could not read Secure Score (requires SecurityEvents.Read.All); skipping." >&2
+    echo "WARNING: could not read Secure Score (requires SecurityEvents.Read.All); skipping.${EXT_HINT}" >&2
 fi
 SECURE_SCORE_LATEST=$(jq -c '(sort_by(.createdDateTime) | last) // {}' <<<"$SECURE_SCORE_ALL")
 SCORE_PROFILES='[]'
@@ -762,6 +867,7 @@ echo "Wrote $(($(wc -l < "$SECURESCORE_CSV") - 1)) Secure Score control rows -> 
 
 SECURESCORE_CURRENT=$(jq -r '.currentScore // ""' <<<"$SECURE_SCORE_LATEST")
 SECURESCORE_MAX=$(jq -r '.maxScore // ""' <<<"$SECURE_SCORE_LATEST")
+GRAPH_AUTH_MODE=cli
 
 # --- Consolidated findings ---
 echo "Compiling security findings..."
@@ -890,6 +996,9 @@ if [[ $SKIP_SECURITY -ne 1 ]]; then
             echo "NOTE: $label unavailable (insufficient Graph permission or feature not licensed); CSV has headers only."
         fi
     done
+    if [[ $EXT_AVAILABLE -ne 1 && ( $RISKYUSERS_AVAILABLE -ne 1 || $SECURESCORE_AVAILABLE -ne 1 ) ]]; then
+        echo "TIP: Secure Score and risky users need permissions the Cloud Shell token lacks; re-run with --extended."
+    fi
 else
     echo ""
     echo "Security review skipped (--skip-security-review)."
