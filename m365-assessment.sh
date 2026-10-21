@@ -87,7 +87,19 @@ on_error() {
     if [[ -s "$WORK/last_error" ]]; then
         echo "  Most recent API error: $(cat "$WORK/last_error")" >&2
     fi
+    auth_hint
     echo "  Re-run the command; if it fails again, run diagnose.sh and share the output." >&2
+}
+# A CAE challenge (TokenIssuedBeforeRevocationTimestamp / InteractionRequired)
+# means the account's sessions were revoked after Cloud Shell signed in; the
+# CLI keeps returning the stale token until it signs in again.
+auth_hint() {
+    if grep -qE 'TokenIssuedBeforeRevocationTimestamp|InteractionRequired' "$WORK/last_error" 2>/dev/null; then
+        echo "  This account's sessions were revoked after Cloud Shell signed in (Continuous Access Evaluation)." >&2
+        echo "  Sign Cloud Shell in again, then re-run:" >&2
+        echo "    az logout" >&2
+        echo "    az login --use-device-code" >&2
+    fi
 }
 trap 'on_error $? $LINENO "$BASH_COMMAND"' ERR
 
@@ -283,6 +295,7 @@ TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 
 USERS_CSV="$OUTPUT_DIR/M365_Users_${TENANT_TAG}_${TIMESTAMP}.csv"
 PRODUCTS_CSV="$OUTPUT_DIR/M365_Products_${TENANT_TAG}_${TIMESTAMP}.csv"
+RECON_CSV="$OUTPUT_DIR/M365_LicenseReconciliation_${TENANT_TAG}_${TIMESTAMP}.csv"
 STALE_CSV="$OUTPUT_DIR/M365_StaleUsers_${TENANT_TAG}_${TIMESTAMP}.csv"
 CA_CSV="$OUTPUT_DIR/M365_ConditionalAccessPolicies_${TENANT_TAG}_${TIMESTAMP}.csv"
 ROLES_CSV="$OUTPUT_DIR/M365_AdminRoleAssignments_${TENANT_TAG}_${TIMESTAMP}.csv"
@@ -378,6 +391,7 @@ NOW_EPOCH=$(date -u +%s)
 echo "Collecting subscribed SKUs..."
 if ! SKUS=$(get_all_pages 'https://graph.microsoft.com/v1.0/subscribedSkus'); then
     echo "WARNING: could not read subscribed SKUs ($(cat "$WORK/last_error" 2>/dev/null)); license totals will be blank." >&2
+    auth_hint
     SKUS='[]'
 fi
 
@@ -446,21 +460,48 @@ else
     echo "WARNING: could not get an Azure Resource Manager token; BillingAccount column will say Unknown." >&2
 fi
 
+# Tag each subscription with where it's billed (_billing), once, so the
+# products CSV and the license reconciliation use the same answer. Match by
+# subscription GUID first; fall back to quantity + term end date.
+SUBS_ENRICHED_FILE="$WORK/subs_enriched.json"
+jq -c --slurpfile billing "$BILLING_SUBS_FILE" --argjson billingAvailable "$BILLING_AVAILABLE" '
+    $billing[0] as $billing |
+    ($billing | map({(.name | ascii_downcase): .}) | add // {}) as $bill_by_id |
+    def billing_match:
+        . as $s |
+        ([.commerceSubscriptionId, .id] | map(select(. != null) | ascii_downcase | $bill_by_id[.] // empty) | .[0])
+        // ([$billing[] | select((.properties.quantity // -1) == ($s.totalLicenses // -2)
+                                and ((.properties.termEndDate // "")[0:10]) == (($s.nextLifecycleDateTime // "x")[0:10]))]
+            | if length == 1 then .[0] else null end);
+    def agreement_label:
+        if . == "MicrosoftCustomerAgreement" then "MCA"
+        elif . == "MicrosoftOnlineServicesProgram" then "MOSA"
+        elif . == "MicrosoftPartnerAgreement" then "MPA (CSP)"
+        elif . == "EnterpriseAgreement" then "EA"
+        else (. // "") end;
+    map(billing_match as $b | . + {_billing: (
+        if $b != null then {
+            source: "billing", account: $b._account.displayName, type: ($b._account.agreementType | agreement_label),
+            profile: ($b.properties.billingProfileDisplayName // ""), reseller: ($b.properties.reseller.description // ""),
+            autoRenew: ($b.properties.autoRenew // "")
+        }
+        elif $billingAvailable == 1 then {source: "unreadable", account: "Not on a readable billing account (CSP partner or legacy MOSA)"}
+        else {source: "unknown", account: "Unknown (billing API not accessible)"}
+        end)})
+' <<<"$SUBS_LIST" > "$SUBS_ENRICHED_FILE"
+
 # Build combined input and emit one row per subscription, with SKU-level
 # consumption joined in. SKUs that have no matching subscription (free /
 # derived products) get an "orphan" row with blank renewal fields, so the
 # CSV remains a complete inventory.
 jq -n -r \
     --slurpfile skus "$(jfile skus "$SKUS")" \
-    --slurpfile subs "$(jfile subs "$SUBS_LIST")" \
+    --slurpfile subs "$SUBS_ENRICHED_FILE" \
     --slurpfile map  "$MAP_FILE" \
-    --slurpfile billing "$BILLING_SUBS_FILE" \
-    --argjson billingAvailable "$BILLING_AVAILABLE" \
     --argjson now  "$NOW_EPOCH" "$JQ_EPOCH"'
-    $skus[0] as $skus | $subs[0] as $subs | $map[0] as $map | $billing[0] as $billing |
+    $skus[0] as $skus | $subs[0] as $subs | $map[0] as $map |
     ($skus | map({(.skuId): .}) | add // {}) as $sku_by_id |
     ($subs | map(.skuId)) as $sub_skus |
-    ($billing | map({(.name | ascii_downcase): .}) | add // {}) as $bill_by_id |
 
     # Approximate whole-and-fractional months until the given renewal date.
     # Average month = 365.25/12 days = 2629800 seconds. Negative => overdue.
@@ -469,33 +510,8 @@ jq -n -r \
         else ((($iso | to_epoch) - $now) / 2629800 * 10 | round / 10)
         end;
 
-    # Match by subscription GUID first; fall back to quantity + term end date.
-    def billing_match:
-        . as $s |
-        ([.commerceSubscriptionId, .id] | map(select(. != null) | ascii_downcase | $bill_by_id[.] // empty) | .[0])
-        // ([$billing[] | select((.properties.quantity // -1) == ($s.totalLicenses // -2)
-                                and ((.properties.termEndDate // "")[0:10]) == (($s.nextLifecycleDateTime // "x")[0:10]))]
-            | if length == 1 then .[0] else null end);
-
-    def agreement_label:
-        if . == "MicrosoftCustomerAgreement" then "MCA"
-        elif . == "MicrosoftOnlineServicesProgram" then "MOSA"
-        elif . == "MicrosoftPartnerAgreement" then "MPA (CSP)"
-        elif . == "EnterpriseAgreement" then "EA"
-        else (. // "") end;
-
     def billing_cols:
-        billing_match as $b |
-        if $b != null then [
-            $b._account.displayName,
-            ($b._account.agreementType | agreement_label),
-            ($b.properties.billingProfileDisplayName // ""),
-            ($b.properties.reseller.description // ""),
-            ($b.properties.autoRenew // "")
-        ]
-        elif $billingAvailable == 1 then ["Not in a readable billing account (likely partner/CSP-billed)", "", "", "", ""]
-        else ["Unknown (billing API not accessible)", "", "", "", ""]
-        end;
+        ._billing as $b | [($b.account // ""), ($b.type // ""), ($b.profile // ""), ($b.reseller // ""), ($b.autoRenew // "")];
 
     def header: [
         "ProductName","SkuPartNumber",
@@ -549,6 +565,57 @@ jq -n -r \
 
 PRODUCT_ROWS=$(($(wc -l < "$PRODUCTS_CSV") - 1))
 echo "Wrote $PRODUCT_ROWS product rows -> $PRODUCTS_CSV"
+
+# ---------------------------------------------------------------------------
+# License reconciliation: for every product the tenant has licenses for,
+# split the total into licenses on a readable billing account, licenses on a
+# subscription we can see but couldn't place on a billing account (CSP or a
+# legacy MOSA account the Billing API doesn't expose), and licenses with no
+# subscription record at all. Anything not fully accounted for is flagged.
+# ---------------------------------------------------------------------------
+RECON_JSON=$(jq -c -n \
+    --slurpfile skus "$WORK/skus.json" \
+    --slurpfile subs "$SUBS_ENRICHED_FILE" \
+    --slurpfile map  "$MAP_FILE" '
+    $skus[0] as $skus | $subs[0] as $subs | $map[0] as $map |
+    def is_free_sku: (.skuPartNumber // "") | test("FREE|VIRAL|TRIAL|EXPLORATORY|ADHOC|WINDOWS_STORE|POWER_BI_STANDARD|STREAM|DEVELOPER"; "i");
+    [ $skus[] | . as $sku
+      | [$subs[] | select(.skuId == $sku.skuId and .status == "Enabled")] as $active
+      | ($sku.prepaidUnits.enabled // 0) as $total
+      | ([$active[] | select(._billing.source == "billing") | .totalLicenses // 0] | add // 0) as $onBilling
+      | ([$active[] | select(._billing.source != "billing") | .totalLicenses // 0] | add // 0) as $unplaced
+      | ([$active[] | .totalLicenses // 0] | add // 0) as $onSubs
+      | ([0, $total - $onSubs] | max) as $noRecord
+      | {
+          product: ($map[$sku.skuId] // $sku.skuPartNumber), sku: $sku.skuPartNumber,
+          total: $total, consumed: ($sku.consumedUnits // 0), activeSubs: ($active | length),
+          onBilling: $onBilling, unplaced: $unplaced, noRecord: $noRecord,
+          accounts: ([$active[] | ._billing.account] | unique | join("; ")),
+          free: (($active | length) == 0 and ($sku | is_free_sku)),
+          billingUnknown: ([$active[] | select(._billing.source == "unknown")] | length > 0)
+        }
+      | .status = (
+          if .free then "Free / self-service SKU (no billing expected)"
+          elif .total == 0 and .activeSubs == 0 then "No licenses"
+          else ([ (if .billingUnknown then "billing API not accessible" else empty end),
+                  (if .unplaced > 0 and (.billingUnknown | not) then ((.unplaced|tostring) + " on subscriptions not in a readable billing account (CSP partner or legacy MOSA)") else empty end),
+                  (if .noRecord > 0 then ((.noRecord|tostring) + " with no subscription record") else empty end),
+                  (if $onSubs > .total and .total > 0 then ("subscriptions total " + ($onSubs|tostring) + ", more than the " + (.total|tostring) + " enabled licenses") else empty end)
+                ] | if length == 0 then "OK: all licenses on a readable billing account" else "CHECK: " + join("; ") end)
+          end) ]
+    | sort_by((if (.status | startswith("CHECK")) then 0 else 1 end), .product)
+')
+
+jq -r '
+    ["ProductName","SkuPartNumber","TotalLicenses","ConsumedLicenses","ActiveSubscriptions",
+     "LicensesOnReadableBillingAccounts","LicensesOnUnplacedSubscriptions","LicensesWithNoSubscriptionRecord",
+     "BillingAccounts","Status"],
+    (.[] | [.product, .sku, .total, .consumed, .activeSubs, .onBilling, .unplaced, .noRecord, .accounts, .status])
+    | @csv
+' <<<"$RECON_JSON" > "$RECON_CSV"
+RECON_CHECK_PRODUCTS=$(jq '[.[] | select(.status | startswith("CHECK"))] | length' <<<"$RECON_JSON")
+RECON_UNPLACED=$(jq '[.[] | select(.free | not) | .unplaced + .noRecord] | add // 0' <<<"$RECON_JSON")
+echo "Wrote $(jq length <<<"$RECON_JSON") license reconciliation rows -> $RECON_CSV ($RECON_CHECK_PRODUCTS product(s) flagged CHECK)"
 
 # ---------------------------------------------------------------------------
 # Users (+ signInActivity if accessible)
@@ -1103,11 +1170,11 @@ rm -f "$USERS_FILE"
 # Zip everything
 # ---------------------------------------------------------------------------
 if [[ $SKIP_SECURITY -ne 1 ]]; then
-    zip -j -q "$ZIP_PATH" "$USERS_CSV" "$PRODUCTS_CSV" "$STALE_CSV" \
+    zip -j -q "$ZIP_PATH" "$USERS_CSV" "$PRODUCTS_CSV" "$RECON_CSV" "$STALE_CSV" \
         "$CA_CSV" "$ROLES_CSV" "$MFA_CSV" "$GUESTS_CSV" "$LEGACYAUTH_CSV" \
         "$OAUTH_CSV" "$RISKYUSERS_CSV" "$SECURESCORE_CSV" "$FINDINGS_CSV"
 else
-    zip -j -q "$ZIP_PATH" "$USERS_CSV" "$PRODUCTS_CSV" "$STALE_CSV"
+    zip -j -q "$ZIP_PATH" "$USERS_CSV" "$PRODUCTS_CSV" "$RECON_CSV" "$STALE_CSV"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1127,6 +1194,7 @@ if [[ $SUBS_AVAILABLE -ne 1 ]]; then
 fi
 if [[ $BILLING_AVAILABLE -eq 1 ]]; then
     echo "Billing accounts:          $BILLING_ACCOUNT_COUNT (see BillingAccount column in the products CSV)"
+    echo "Licenses not on a readable billing account: $RECON_UNPLACED across $RECON_CHECK_PRODUCTS product(s) -> $RECON_CSV"
 else
     echo "NOTE: billing accounts were not readable; BillingAccount column says Unknown."
 fi
@@ -1165,6 +1233,7 @@ echo ""
 echo "Files:"
 echo "  $USERS_CSV"
 echo "  $PRODUCTS_CSV"
+echo "  $RECON_CSV"
 echo "  $STALE_CSV"
 if [[ $SKIP_SECURITY -ne 1 ]]; then
     echo "  $CA_CSV"
