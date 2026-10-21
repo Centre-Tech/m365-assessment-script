@@ -71,6 +71,26 @@ mkdir -p "$OUTPUT_DIR"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
+# Never exit silently: report the failing line and the most recent API error.
+# set -E makes the trap fire inside functions and $(...) too; the flag file
+# keeps it to one report as the failure propagates up.
+set -E
+on_error() {
+    local rc=$1 line=$2 cmd=$3
+    # Failures inside $(...) subshells don't stop the script on their own;
+    # only report the one that actually ends the main shell.
+    [[ "$BASHPID" == "$$" ]] || return 0
+    [[ -e "$WORK/err_reported" ]] && return 0
+    touch "$WORK/err_reported"
+    echo "" >&2
+    echo "ERROR: the assessment stopped (exit $rc) at line $line: $cmd" >&2
+    if [[ -s "$WORK/last_error" ]]; then
+        echo "  Most recent API error: $(cat "$WORK/last_error")" >&2
+    fi
+    echo "  Re-run the command; if it fails again, run diagnose.sh and share the output." >&2
+}
+trap 'on_error $? $LINENO "$BASH_COMMAND"' ERR
+
 # Large JSON must never be passed to jq via --argjson: Linux caps a single
 # argv string at 128 KB, which multi-page Graph results easily exceed. Write it
 # to a file and pass it with --slurpfile instead (bound as $name[0] in jq).
@@ -233,6 +253,8 @@ graph_get() {
                 break ;;
         esac
     done
+    printf 'HTTP %s from %s: %s\n' "$code" "${url%%\?*}" \
+        "$(jq -r '.error.message // .error_description // .error // empty' "$body" 2>/dev/null | head -c 300 || true)" > "$WORK/last_error"
     rm -f "$hdr" "$body"
     return 1
 }
@@ -354,7 +376,10 @@ get_all_pages() {
 NOW_EPOCH=$(date -u +%s)
 
 echo "Collecting subscribed SKUs..."
-SKUS=$(get_all_pages 'https://graph.microsoft.com/v1.0/subscribedSkus')
+if ! SKUS=$(get_all_pages 'https://graph.microsoft.com/v1.0/subscribedSkus'); then
+    echo "WARNING: could not read subscribed SKUs ($(cat "$WORK/last_error" 2>/dev/null)); license totals will be blank." >&2
+    SKUS='[]'
+fi
 
 echo "Collecting subscription renewal info (companySubscription)..."
 SUBS_LIST='[]'
