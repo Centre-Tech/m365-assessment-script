@@ -18,6 +18,8 @@ set -euo pipefail
 STALE_DAYS=90
 OUTPUT_DIR="$HOME"
 SKIP_FRIENDLY=0
+SKIP_E5FIT=0
+PBI_DAYS=28
 NO_DOWNLOAD=0
 SKIP_SECURITY=0
 LEGACY_AUTH_DAYS=7
@@ -34,6 +36,7 @@ Usage: $0 [options]
   --stale-days N           Stale account threshold in days (default 90)
   --output-dir PATH        Output directory (default: \$HOME)
   --skip-friendly-names    Skip downloading Microsoft's SKU friendly-name map
+  --skip-e5-fit            Skip the per-user Microsoft 365 E5 -> Business Premium fit check
   --skip-security-review   Skip the security review checks (CA, MFA, roles, OAuth apps, etc.)
   --legacy-auth-days N     Sign-in log lookback window for legacy-auth detection (default 7)
   --no-download            Skip the Cloud Shell download dialog at the end
@@ -48,6 +51,7 @@ while [[ $# -gt 0 ]]; do
         --stale-days)          STALE_DAYS="$2"; shift 2 ;;
         --output-dir)          OUTPUT_DIR="$2"; shift 2 ;;
         --skip-friendly-names) SKIP_FRIENDLY=1; shift ;;
+        --skip-e5-fit)         SKIP_E5FIT=1; shift ;;
         --skip-security-review) SKIP_SECURITY=1; shift ;;
         --legacy-auth-days)    LEGACY_AUTH_DAYS="$2"; shift 2 ;;
         --no-download)         NO_DOWNLOAD=1; shift ;;
@@ -126,22 +130,34 @@ TOKEN_EXP_FILE="$WORK/token_exp"
 # used only for those calls (GRAPH_AUTH_MODE=ext).
 GRAPH_AUTH_MODE=cli
 EXT_CLIENT_ID='14d82eec-204b-4c2f-b7e8-296a70dab67e'
-EXT_SCOPES='https://graph.microsoft.com/SecurityEvents.Read.All https://graph.microsoft.com/IdentityRiskyUser.Read.All offline_access'
+# The E5 -> Business Premium fit check adds mailbox usage reports, Teams phone
+# numbers, PIM eligibility, eDiscovery custodians and Intune devices.
+EXT_SCOPES='https://graph.microsoft.com/SecurityEvents.Read.All https://graph.microsoft.com/IdentityRiskyUser.Read.All https://graph.microsoft.com/Reports.Read.All https://graph.microsoft.com/TeamsTelephoneNumber.Read.All https://graph.microsoft.com/RoleEligibilitySchedule.Read.Directory https://graph.microsoft.com/eDiscovery.Read.All https://graph.microsoft.com/DeviceManagementManagedDevices.Read.All offline_access'
 EXT_TOKEN_FILE="$WORK/ext_token"
 EXT_EXP_FILE="$WORK/ext_token_exp"
 EXT_REFRESH_FILE="$WORK/ext_refresh"
 
-# Azure Resource Manager token (same Cloud Shell session) for the Billing API,
-# used only to map license subscriptions to billing accounts (GRAPH_AUTH_MODE=arm).
+# Azure Resource Manager (Billing API) and Power BI tokens from the same Cloud
+# Shell session (GRAPH_AUTH_MODE=arm / pbi). Stored as $WORK/<mode>_token.
 ARM_TOKEN_FILE="$WORK/arm_token"
 ARM_EXP_FILE="$WORK/arm_token_exp"
 
-arm_token() {
-    local args=(account get-access-token --resource https://management.azure.com -o json) out
+res_token() {
+    local mode=$1 resource=$2 out
+    local args=(account get-access-token --resource "$resource" -o json)
     [[ -n "$TENANT" ]] && args+=(--tenant "$TENANT")
     out=$(az "${args[@]}" 2>/dev/null) || return 1
-    jq -e -r '.accessToken' <<<"$out" > "$ARM_TOKEN_FILE" || return 1
-    jq -r '.expires_on // empty' <<<"$out" > "$ARM_EXP_FILE"
+    jq -e -r '.accessToken' <<<"$out" > "$WORK/${mode}_token" || return 1
+    jq -r '.expires_on // empty' <<<"$out" > "$WORK/${mode}_token_exp"
+}
+arm_token() { res_token arm https://management.azure.com; }
+pbi_token() { res_token pbi https://analysis.windows.net/powerbi/api; }
+mode_token() {
+    case "$GRAPH_AUTH_MODE" in
+        arm) arm_token ;;
+        pbi) pbi_token ;;
+        *)   return 1 ;;
+    esac
 }
 
 ext_store() {
@@ -206,12 +222,13 @@ refresh_token() {
 auth_header() {
     local exp now
     now=$(date +%s)
-    if [[ "$GRAPH_AUTH_MODE" == arm ]]; then
-        exp=$(cat "$ARM_EXP_FILE" 2>/dev/null || echo 0)
+    if [[ "$GRAPH_AUTH_MODE" == arm || "$GRAPH_AUTH_MODE" == pbi ]]; then
+        exp=$(cat "$WORK/${GRAPH_AUTH_MODE}_token_exp" 2>/dev/null || echo 0)
+        [[ "$exp" =~ ^[0-9]+$ ]] || exp=0
         if (( exp - now < 300 )); then
-            arm_token || true
+            mode_token || true
         fi
-        printf 'Authorization: Bearer %s' "$(cat "$ARM_TOKEN_FILE")"
+        printf 'Authorization: Bearer %s' "$(cat "$WORK/${GRAPH_AUTH_MODE}_token")"
         return
     fi
     if [[ "$GRAPH_AUTH_MODE" == ext ]]; then
@@ -248,8 +265,8 @@ graph_get() {
                 refreshed=1
                 if [[ "$GRAPH_AUTH_MODE" == ext ]]; then
                     ext_refresh || break
-                elif [[ "$GRAPH_AUTH_MODE" == arm ]]; then
-                    arm_token || break
+                elif [[ "$GRAPH_AUTH_MODE" == arm || "$GRAPH_AUTH_MODE" == pbi ]]; then
+                    mode_token || break
                 else
                     refresh_token || break
                 fi ;;
@@ -306,6 +323,7 @@ OAUTH_CSV="$OUTPUT_DIR/M365_OAuthConsent_${TENANT_TAG}_${TIMESTAMP}.csv"
 RISKYUSERS_CSV="$OUTPUT_DIR/M365_RiskyUsers_${TENANT_TAG}_${TIMESTAMP}.csv"
 SECURESCORE_CSV="$OUTPUT_DIR/M365_SecureScore_${TENANT_TAG}_${TIMESTAMP}.csv"
 FINDINGS_CSV="$OUTPUT_DIR/M365_SecurityFindings_${TENANT_TAG}_${TIMESTAMP}.csv"
+E5FIT_CSV="$OUTPUT_DIR/M365_E5ToBusinessPremium_${TENANT_TAG}_${TIMESTAMP}.csv"
 ZIP_PATH="$OUTPUT_DIR/M365_Assessment_${TENANT_TAG}_${TIMESTAMP}.zip"
 
 echo "Connected to: $TENANT_NAME  ($TENANT_ID)"
@@ -1164,6 +1182,217 @@ echo "Wrote $TOTAL_FINDINGS security finding rows -> $FINDINGS_CSV"
 
 fi
 
+# ---------------------------------------------------------------------------
+# Microsoft 365 E5 -> Business Premium fit (per user)
+# A user can move only if they don't rely on anything E5 includes that
+# Business Premium doesn't. Hard blockers keep E5; gaps that an add-on closes
+# are listed as add-ons; anything needing judgment is flagged Review. Data a
+# check needs but couldn't read is listed under NotChecked, never assumed OK.
+# ---------------------------------------------------------------------------
+E5FIT_RAN=0
+if [[ $SKIP_E5FIT -ne 1 ]]; then
+E5_USER_COUNT=$(jq --slurpfile skus "$WORK/skus.json" '
+    ($skus[0] | map(select((.skuPartNumber // "") | test("^(SPE_E5|Microsoft_365_E5)"; "i")) | .skuId)) as $e5 |
+    [.[] | select(any((.assignedLicenses // [])[]; .skuId as $s | $e5 | index($s)))] | length' < "$USERS_FILE")
+
+if (( E5_USER_COUNT > 0 )); then
+    E5FIT_RAN=1
+    echo ""
+    echo "Checking $E5_USER_COUNT Microsoft 365 E5 user(s) for Business Premium fit..."
+
+    # Prefer the --extended token (it carries the extra scopes); fall back to
+    # the Cloud Shell token.
+    get_all_pages_any() {
+        local out
+        if [[ $EXT_AVAILABLE -eq 1 ]]; then
+            if out=$(GRAPH_AUTH_MODE=ext get_all_pages "$@"); then
+                echo "$out"; return 0
+            fi
+        fi
+        GRAPH_AUTH_MODE=cli get_all_pages "$@"
+    }
+    fit_flag() { echo "$1" > "$WORK/fit_$2.ok"; }
+
+    # Mailbox size (Business Premium mailboxes are 50 GB; E5 is 100 GB).
+    MBX='[]'
+    if MBX_TRY=$(get_all_pages_any "https://graph.microsoft.com/beta/reports/getMailboxUsageDetail(period='D7')?\$format=application/json"); then
+        if [[ $(jq 'length' <<<"$MBX_TRY") -gt 0 && $(jq '[.[] | select((.userPrincipalName // "") | contains("@"))] | length' <<<"$MBX_TRY") -eq 0 ]]; then
+            echo "  NOTE: usage reports conceal user names, so mailbox sizes can't be matched. Turn off 'Display concealed user, group, and site names' in Microsoft 365 admin center > Settings > Org settings > Reports." >&2
+        else
+            MBX="$MBX_TRY"; fit_flag 1 mailbox
+        fi
+    else
+        echo "  NOTE: mailbox usage report unavailable (needs Reports.Read.All; use --extended)." >&2
+    fi
+
+    # Teams phone numbers assigned to users.
+    NUMS='[]'
+    for NUM_URL in 'https://graph.microsoft.com/v1.0/admin/teams/telephoneNumberManagement/numberAssignments' \
+                   'https://graph.microsoft.com/beta/admin/teams/telephoneNumberManagement/numberAssignments'; do
+        if NUM_TRY=$(get_all_pages_any "$NUM_URL"); then NUMS="$NUM_TRY"; fit_flag 1 numbers; break; fi
+    done
+    [[ -e "$WORK/fit_numbers.ok" ]] || echo "  NOTE: Teams phone number assignments unavailable (needs TeamsTelephoneNumber.Read.All and Teams admin; use --extended). Calling-plan licenses are still checked." >&2
+
+    # PIM-eligible directory roles (need Entra ID P2).
+    PIM='[]'
+    if PIM_TRY=$(get_all_pages_any 'https://graph.microsoft.com/v1.0/roleManagement/directory/roleEligibilitySchedules'); then
+        PIM="$PIM_TRY"; fit_flag 1 pim
+    else
+        echo "  NOTE: PIM eligibility unavailable (needs RoleEligibilitySchedule.Read.Directory; use --extended)." >&2
+    fi
+
+    # eDiscovery (Premium) case custodians.
+    CUSTODIANS='[]'
+    if CASES=$(get_all_pages_any 'https://graph.microsoft.com/v1.0/security/cases/ediscoveryCases'); then
+        CUST_OK=1
+        : > "$WORK/custodians.txt"
+        while read -r case_id; do
+            [[ -n "$case_id" ]] || continue
+            if C_TRY=$(get_all_pages_any "https://graph.microsoft.com/v1.0/security/cases/ediscoveryCases/${case_id}/custodians"); then
+                jq -r '.[] | .email // empty' <<<"$C_TRY" >> "$WORK/custodians.txt"
+            else
+                CUST_OK=0
+            fi
+        done < <(jq -r '.[] | select((.status // "") != "closed") | .id' <<<"$CASES")
+        CUSTODIANS=$(jq -R -s -c 'split("\n") | map(select(length > 0))' "$WORK/custodians.txt")
+        [[ $CUST_OK -eq 1 ]] && fit_flag 1 ediscovery
+    else
+        echo "  NOTE: eDiscovery cases unavailable (needs eDiscovery.Read.All and the eDiscovery Manager role; use --extended)." >&2
+    fi
+
+    # Intune-managed Windows devices on the Enterprise edition (E5 grants
+    # Windows Enterprise via subscription activation; Business Premium doesn't).
+    DEVS='[]'
+    if DEV_TRY=$(get_all_pages_any 'https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?$select=userPrincipalName,deviceName,operatingSystem,skuFamily'); then
+        DEVS="$DEV_TRY"; fit_flag 1 devices
+    else
+        echo "  NOTE: Intune devices unavailable (needs DeviceManagementManagedDevices.Read.All; use --extended)." >&2
+    fi
+
+    # Power BI activity (Power BI Pro is in E5, not Business Premium). One
+    # call per UTC day via the Power BI admin activity log.
+    echo '{}' > "$WORK/pbi_users.json"
+    if pbi_token; then
+        : > "$WORK/pbi_events.txt"
+        PBI_OK=1
+        for ((d = 1; d <= PBI_DAYS; d++)); do
+            day=$(date -u -d "@$((NOW_EPOCH - d * 86400))" +%Y-%m-%d)
+            url="https://api.powerbi.com/v1.0/myorg/admin/activityevents?startDateTime=%27${day}T00:00:00.000Z%27&endDateTime=%27${day}T23:59:59.999Z%27"
+            while [[ -n "$url" ]]; do
+                resp=$(GRAPH_AUTH_MODE=pbi graph_get "$url") || { PBI_OK=0; break 2; }
+                jq -r '.activityEventEntities[]? | .UserId // empty' <<<"$resp" >> "$WORK/pbi_events.txt"
+                url=$(jq -r 'if .lastResultSet == true then empty else (.continuationUri // empty) end' <<<"$resp")
+            done
+        done
+        if [[ $PBI_OK -eq 1 ]]; then
+            jq -R -s 'split("\n") | map(select(length > 0) | ascii_downcase) | group_by(.) | map({(.[0]): length}) | add // {}' \
+                "$WORK/pbi_events.txt" > "$WORK/pbi_users.json"
+            fit_flag 1 pbi
+        else
+            echo "  NOTE: Power BI activity log unavailable (needs Fabric/Power BI administrator or Global Admin)." >&2
+        fi
+    else
+        echo "  NOTE: could not get a Power BI token; Power BI usage not checked." >&2
+    fi
+
+    [[ -s "$WORK/roledefs.json" ]] || echo '[]' > "$WORK/roledefs.json"
+    FIT_FLAGS=$(jq -n -c --arg m "$( [[ -e $WORK/fit_mailbox.ok ]] && echo 1)" --arg n "$( [[ -e $WORK/fit_numbers.ok ]] && echo 1)" \
+        --arg p "$( [[ -e $WORK/fit_pim.ok ]] && echo 1)" --arg e "$( [[ -e $WORK/fit_ediscovery.ok ]] && echo 1)" \
+        --arg d "$( [[ -e $WORK/fit_devices.ok ]] && echo 1)" --arg b "$( [[ -e $WORK/fit_pbi.ok ]] && echo 1)" \
+        --arg r "$ROLES_AVAILABLE" --arg c "$CA_AVAILABLE" \
+        '{mailbox: ($m == "1"), numbers: ($n == "1"), pim: ($p == "1"), ediscovery: ($e == "1"), devices: ($d == "1"), pbi: ($b == "1"),
+          roles: ($r == "1"), ca: ($c == "1")}')
+
+    read -r -d '' FIT_JQ <<'JQ' || true
+$skus[0] as $skus | $roles[0] as $roles | $ca[0] as $ca | $pim[0] as $pim | $mbx[0] as $mbx |
+$nums[0] as $nums | $pbi[0] as $pbi | $cust[0] as $cust | $devs[0] as $devs | $roledefs[0] as $roledefs |
+($skus | map({(.skuId): .}) | add // {}) as $sku_by_id |
+($skus | map(select((.skuPartNumber // "") | test("^(SPE_E5|Microsoft_365_E5)"; "i")) | .skuId)) as $e5ids |
+($mbx | map(select(.userPrincipalName != null) | {(.userPrincipalName | ascii_downcase): .}) | add // {}) as $mbx_by_upn |
+($cust | map(ascii_downcase)) as $custodians |
+($roledefs | map({(.id): .displayName}) | add // {}) as $rd |
+[ $ca[] | select(.state == "enabled")
+        | select(((.conditions.userRiskLevels // []) | length) > 0 or ((.conditions.signInRiskLevels // []) | length) > 0) ] as $riskca |
+def sku_name: . as $id | ($map[$id] // $sku_by_id[$id].skuPartNumber // $id);
+def gb: (. / 1073741824 * 10 | round / 10);
+[ .[] | . as $u
+  | ([(.assignedLicenses // [])[] | .skuId]) as $assigned
+  | select(any($assigned[]; . as $s | $e5ids | index($s)))
+  | ($assigned | map(select(. as $s | $e5ids | index($s)))) as $myE5
+  | ($assigned | map(select(. as $s | $e5ids | index($s) | not))) as $other
+  | ([$other[] | ($sku_by_id[.].servicePlans // [])[] | .servicePlanName]) as $otherPlans
+  | (($u.userPrincipalName // "") | ascii_downcase) as $upn
+  | days_since(most_recent) as $days
+  | ($signin and $days == null and (($u.createdDateTime // "") != "") and ($u.createdDateTime | to_epoch) < $cutoff) as $neverSignedIn
+  | ([$nums[] | select(.assignmentTargetId == $u.id) | .telephoneNumber] | join(";")) as $number
+  | any($otherPlans[]; test("^MCOEV")) as $phoneElsewhere
+  | any($otherPlans[]; test("^MCOPSTN(?!C$)")) as $callingPlan
+  | any($otherPlans[]; test("^BI_AZURE_P[23]")) as $pbiElsewhere
+  | ($pbi[$upn] // 0) as $pbiEvents
+  | $mbx_by_upn[$upn] as $m
+  | (if $m then (($m.storageUsedInBytes // 0) | tonumber | gb) else null end) as $mgb
+  | ([$roles[] | select(.principalId == $u.id) | (.roleDefinition.displayName // .roleDefinitionId)] | unique) as $adminRoles
+  | ([$pim[] | select(.principalId == $u.id) | ($rd[.roleDefinitionId] // .roleDefinitionId)] | unique) as $pimRoles
+  | ([$devs[] | select(((.userPrincipalName // "") | ascii_downcase) == $upn and ((.skuFamily // "") | test("enterprise"; "i")))] | length) as $entDevices
+  | any($riskca[]; ((.conditions.users.includeUsers // []) | (index("All") != null or index($u.id) != null))) as $riskCovered
+  | ([ (if $flags.mailbox | not then "mailbox size" else empty end),
+       (if $flags.pbi | not then "Power BI activity" else empty end),
+       (if $flags.numbers | not then "Teams phone numbers" else empty end),
+       (if $flags.pim | not then "PIM eligibility" else empty end),
+       (if $flags.ediscovery | not then "eDiscovery custodians" else empty end),
+       (if $flags.devices | not then "Intune devices" else empty end),
+       (if $flags.roles | not then "admin roles" else empty end),
+       (if $flags.ca | not then "Conditional Access" else empty end) ]) as $notChecked
+  | ([ (if $mgb != null and $mgb > 50 then "Mailbox " + ($mgb|tostring) + " GB exceeds the 50 GB Business Premium limit" else empty end),
+       (if ($custodians | index($upn)) != null then "Custodian in an open eDiscovery (Premium) case" else empty end) ]) as $blockers
+  | ([ (if ($adminRoles | length) > 0 then "Holds admin role(s): " + ($adminRoles | join(", ")) else empty end),
+       (if $mgb != null and $mgb > 40 and $mgb <= 50 then "Mailbox " + ($mgb|tostring) + " GB is close to the 50 GB limit" else empty end),
+       (if $entDevices > 0 then ($entDevices|tostring) + " Windows Enterprise device(s) would fall back to Windows Pro" else empty end) ]) as $reviews
+  | ([ (if ($number != "" or $callingPlan) and ($phoneElsewhere | not) then {a: "Teams Phone Standard", r: ("Uses Teams Phone (" + (if $number != "" then $number else "calling plan license" end) + ") with Phone System only from E5")} else empty end),
+       (if $pbiEvents > 0 and ($pbiElsewhere | not) then {a: "Power BI Pro", r: ("Used Power BI (" + ($pbiEvents|tostring) + " events in " + ($pbiDays|tostring) + " days)")} else empty end),
+       (if ($pimRoles | length) > 0 then {a: "Entra ID P2", r: ("PIM-eligible role(s): " + ($pimRoles | join(", ")))} else empty end),
+       (if $riskCovered then {a: "Entra ID P2", r: "Covered by a risk-based Conditional Access policy"} else empty end) ]) as $addons
+  | (if ($u.accountEnabled != true) or ($days != null and $days >= $stale) or $neverSignedIn then "Remove license (inactive)"
+     elif ($blockers | length) > 0 then "Keep E5"
+     elif ($reviews | length) > 0 then "Review"
+     elif ($addons | length) > 0 then "Business Premium + add-ons"
+     else "Business Premium" end) as $rec
+  | { upn: $u.userPrincipalName, name: $u.displayName, dept: $u.department, title: $u.jobTitle, enabled: $u.accountEnabled, days: $days,
+      e5: ($myE5 | map(sku_name) | join(";")), other: ($other | map(sku_name) | join(";")),
+      rec: (if ($rec | startswith("Business Premium")) and ($notChecked | length) > 0 then $rec + " (unverified)" else $rec end),
+      addons: ([$addons[].a] | unique | join("; ")),
+      reasons: ([$blockers[], $reviews[], $addons[].r] | join("; ")),
+      mgb: $mgb, pbi: (if $flags.pbi then $pbiEvents else null end), number: $number,
+      admin: ($adminRoles | join(", ")), notChecked: ($notChecked | join(", ")) } ]
+| sort_by((if .rec == "Keep E5" then 0 elif .rec == "Review" then 1 elif (.rec | startswith("Business Premium +")) then 2 elif (.rec | startswith("Business Premium")) then 3 else 4 end), (.upn // ""))
+JQ
+
+    FIT_JSON=$(jq -c \
+        --slurpfile map "$MAP_FILE" --slurpfile skus "$WORK/skus.json" \
+        --slurpfile roles "$(jfile fit_roles "${ROLE_ASSIGNMENTS:-[]}")" --slurpfile ca "$(jfile fit_ca "${CA_POLICIES:-[]}")" \
+        --slurpfile pim "$(jfile fit_pim "$PIM")" --slurpfile mbx "$(jfile fit_mbx "$MBX")" \
+        --slurpfile nums "$(jfile fit_nums "$NUMS")" --slurpfile pbi "$WORK/pbi_users.json" \
+        --slurpfile cust "$(jfile fit_cust "$CUSTODIANS")" --slurpfile devs "$(jfile fit_devs "$DEVS")" \
+        --slurpfile roledefs "$WORK/roledefs.json" \
+        --argjson flags "$FIT_FLAGS" --argjson now "$NOW_EPOCH" --argjson stale "$STALE_DAYS" --argjson cutoff "$CUTOFF_EPOCH" \
+        --argjson signin "$( [[ $SIGNIN_AVAILABLE -eq 1 ]] && echo true || echo false)" --argjson pbiDays "$PBI_DAYS" \
+        "$JQ_PRELUDE
+$FIT_JQ" < "$USERS_FILE")
+
+    jq -r '
+        ["UserPrincipalName","DisplayName","Department","JobTitle","AccountEnabled","DaysSinceLastActivity","E5License","OtherLicenses",
+         "Recommendation","AddOnsNeeded","Reasons","MailboxGB","PowerBIEvents","TeamsPhoneNumber","AdminRoles","NotChecked"],
+        (.[] | [.upn, .name, .dept, .title, .enabled, .days, .e5, .other, .rec, .addons, .reasons, .mgb, .pbi, .number, .admin, .notChecked])
+        | @csv' <<<"$FIT_JSON" > "$E5FIT_CSV"
+
+    FIT_SUMMARY=$(jq -r 'group_by(.rec) | map("  \(.[0].rec): \(length)") | join("\n")' <<<"$FIT_JSON")
+    FIT_BP_CANDIDATES=$(jq '[.[] | select(.rec | startswith("Business Premium"))] | length' <<<"$FIT_JSON")
+    FIT_NOT_CHECKED=$(jq -r '[.[0].notChecked // ""] | .[0]' <<<"$FIT_JSON")
+    BP_CURRENT=$(jq '[.[] | select((.skuPartNumber // "") | test("^SPB$|Business_Premium"; "i")) | .prepaidUnits.enabled // 0] | add // 0' "$WORK/skus.json")
+    echo "Wrote $E5_USER_COUNT E5 fit rows -> $E5FIT_CSV"
+fi
+fi
+
 rm -f "$USERS_FILE"
 
 # ---------------------------------------------------------------------------
@@ -1175,6 +1404,9 @@ if [[ $SKIP_SECURITY -ne 1 ]]; then
         "$OAUTH_CSV" "$RISKYUSERS_CSV" "$SECURESCORE_CSV" "$FINDINGS_CSV"
 else
     zip -j -q "$ZIP_PATH" "$USERS_CSV" "$PRODUCTS_CSV" "$RECON_CSV" "$STALE_CSV"
+fi
+if [[ $E5FIT_RAN -eq 1 ]]; then
+    zip -j -q "$ZIP_PATH" "$E5FIT_CSV"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1229,12 +1461,27 @@ else
     echo ""
     echo "Security review skipped (--skip-security-review)."
 fi
+if [[ $E5FIT_RAN -eq 1 ]]; then
+    echo ""
+    echo "-- Microsoft 365 E5 -> Business Premium fit ($E5_USER_COUNT E5 users) --"
+    echo "$FIT_SUMMARY"
+    echo "  Business Premium seats today: $BP_CURRENT; after moving all candidates: $((BP_CURRENT + FIT_BP_CANDIDATES)) (cap is 300 per tenant)"
+    if [[ -n "$FIT_NOT_CHECKED" ]]; then
+        echo "  NOTE: not checked: $FIT_NOT_CHECKED. Re-run with --extended; until then treat candidates as unverified for these."
+    fi
+    echo "  Also confirm by hand (no per-user API): Purview insider risk / communication compliance / auto-labeling,"
+    echo "  Defender for Office 365 P2 (Threat Explorer, attack simulation), Defender for Endpoint P2, Defender for Identity / Cloud Apps."
+    echo "  -> $E5FIT_CSV"
+fi
 echo ""
 echo "Files:"
 echo "  $USERS_CSV"
 echo "  $PRODUCTS_CSV"
 echo "  $RECON_CSV"
 echo "  $STALE_CSV"
+if [[ $E5FIT_RAN -eq 1 ]]; then
+    echo "  $E5FIT_CSV"
+fi
 if [[ $SKIP_SECURITY -ne 1 ]]; then
     echo "  $CA_CSV"
     echo "  $ROLES_CSV"
