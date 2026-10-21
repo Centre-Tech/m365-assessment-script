@@ -30,3 +30,16 @@ for u in 'roleManagement/directory/roleAssignments?$expand=principal($select=id,
     echo "$c  $u  $n $m"
 done
 rm -f /tmp/diag.json
+
+echo ""
+echo "--- Billing accounts (Azure Billing API) ---"
+A=$(az account get-access-token --resource https://management.azure.com --query accessToken -o tsv 2>/dev/null)
+B='https://management.azure.com/providers/Microsoft.Billing/billingAccounts'
+c=$(curl -s -o /tmp/diag.json -w '%{http_code}' -H "Authorization: Bearer $A" "$B?api-version=2024-04-01&includeAll=true&includeResellee=true")
+echo "$c  billingAccounts  $(jq -r '.error.message // empty' /tmp/diag.json 2>/dev/null | head -c 160)"
+jq -r '.value[]? | [.name, .properties.displayName, .properties.agreementType] | @tsv' /tmp/diag.json 2>/dev/null |
+while IFS=$'\t' read -r name display type; do
+    c=$(curl -s -o /tmp/diag2.json -w '%{http_code}' -H "Authorization: Bearer $A" "$B/$name/billingSubscriptions?api-version=2024-04-01")
+    echo "$c  $display ($type): $(jq -r 'if .value then (.value | length | tostring) + " subscriptions" else (.error.message // "" | .[0:120]) end' /tmp/diag2.json 2>/dev/null)"
+done
+rm -f /tmp/diag.json /tmp/diag2.json

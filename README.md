@@ -30,7 +30,7 @@ curl -s https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/
 | File in zip | What's in it |
 | --- | --- |
 | `M365_Users_<tenant>_<ts>.csv`        | Mirrors the admin center "Active users" export plus sign-in activity (last interactive / non-interactive / successful sign-in, days since last activity). |
-| `M365_Products_<tenant>_<ts>.csv`     | Subscribed SKUs across all billing accounts the tenant can see (total / consumed / available licenses, service plans, friendly product names). |
+| `M365_Products_<tenant>_<ts>.csv`     | One row per license subscription across all billing accounts (total / consumed / available licenses, service plans, renewal date, friendly product names), plus `BillingAccount`, `BillingAgreementType` (MCA / MOSA / EA / MPA), `BillingProfile`, `Reseller` and `AutoRenew` from the Azure Billing API. Subscriptions not found in any billing account the signed-in user can read are labeled as likely partner/CSP-billed. |
 | `M365_StaleUsers_<tenant>_<ts>.csv`   | Enabled, non-guest accounts whose most recent sign-in is older than `--stale-days` (default 90), or that have never signed in and were created longer ago than the threshold. |
 | `M365_ConditionalAccessPolicies_<tenant>_<ts>.csv` | Every Conditional Access policy: state, scope (users/apps/client app types), grant/session controls. |
 | `M365_AdminRoleAssignments_<tenant>_<ts>.csv` | Active Microsoft Entra directory role assignments, flagged by whether the role is high-privilege. |
@@ -40,7 +40,7 @@ curl -s https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/
 | `M365_OAuthConsent_<tenant>_<ts>.csv` | Every delegated and application permission grant to an enterprise app, with high-risk permissions flagged. |
 | `M365_RiskyUsers_<tenant>_<ts>.csv`   | Microsoft Entra ID Protection risky users (requires Entra ID P2). |
 | `M365_SecureScore_<tenant>_<ts>.csv`  | Microsoft Secure Score, per control, worst-implemented first. |
-| `M365_SecurityFindings_<tenant>_<ts>.csv` | Consolidated High/Medium/Low findings synthesized across all of the above, sorted by severity. |
+| `M365_SecurityFindings_<tenant>_<ts>.csv` | Consolidated High/Medium/Low findings synthesized across all of the above, sorted by severity. App consent findings are one row per third-party app (listing its high-risk permissions, admin consent and user-consent count); service principals holding Global Administrator are flagged separately from the human Global Admin count. |
 
 ## Options
 
@@ -64,8 +64,17 @@ curl -s https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/
 - `signInActivity` on user rows, MFA registration details, and the legacy-auth scan require `AuditLog.Read.All` consent on the Azure CLI app. If it's not granted, those exports still produce successfully but the relevant columns/CSVs are blank, and the stale list falls back to a created-date heuristic.
 - Risky users (`M365_RiskyUsers_*.csv`) require an **Entra ID P2** license — on P1/free tenants the CSV is written with headers only.
 - Every security-review sub-check degrades gracefully: if the signed-in account lacks the Graph permission for it, the script prints a warning, writes a header-only CSV, and continues rather than aborting.
+- Billing account mapping uses the Azure Billing API with the same Cloud Shell session. Global Administrator, Global Reader or a billing role is enough to list billing accounts; if they can't be read, the `BillingAccount` column says `Unknown`.
 - Large tenants: Graph throttling (HTTP 429) and transient 5xx errors are retried automatically (honoring `Retry-After`), and the Graph token is refreshed before it expires, so long runs complete unattended.
 - Always check the `Connected to:` line at the start of the run. If you're signed in with a partner account, Cloud Shell may be pointed at your home tenant rather than the customer's; use `--tenant`.
+
+## Troubleshooting
+
+If a CSV comes back empty, run the diagnostic. It prints the signed-in identity, token scopes, and the HTTP status for each Graph and Billing endpoint the assessment uses:
+
+```bash
+curl -s https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/main/diagnose.sh | bash
+```
 
 ## Running locally
 
