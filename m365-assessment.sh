@@ -8,7 +8,7 @@
 # the Cloud Shell download dialog.
 #
 # Usage:
-#   ./m365-assessment.sh [--stale-days N] [--output-dir PATH] [--skip-friendly-names] [--no-download]
+#   ./m365-assessment.sh [--tenant ID|DOMAIN] [--stale-days N] [--output-dir PATH] [--skip-friendly-names] [--no-download]
 #
 # One-liner (paste into Cloud Shell, Bash mode):
 #   curl -s https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/main/m365-assessment.sh | bash
@@ -21,10 +21,13 @@ SKIP_FRIENDLY=0
 NO_DOWNLOAD=0
 SKIP_SECURITY=0
 LEGACY_AUTH_DAYS=7
+TENANT=""
+MAX_RETRIES=6
 
 usage() {
     cat <<EOF
 Usage: $0 [options]
+  --tenant ID|DOMAIN       Target tenant (default: the tenant of the current Azure CLI session)
   --stale-days N           Stale account threshold in days (default 90)
   --output-dir PATH        Output directory (default: \$HOME)
   --skip-friendly-names    Skip downloading Microsoft's SKU friendly-name map
@@ -37,6 +40,7 @@ EOF
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --tenant)              TENANT="$2"; shift 2 ;;
         --stale-days)          STALE_DAYS="$2"; shift 2 ;;
         --output-dir)          OUTPUT_DIR="$2"; shift 2 ;;
         --skip-friendly-names) SKIP_FRIENDLY=1; shift ;;
@@ -60,17 +64,94 @@ done
 
 mkdir -p "$OUTPUT_DIR"
 
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
+# Large JSON must never be passed to jq via --argjson: Linux caps a single
+# argv string at 128 KB, which multi-page Graph results easily exceed. Write it
+# to a file and pass it with --slurpfile instead (bound as $name[0] in jq).
+jfile() {
+    printf '%s' "$2" > "$WORK/$1.json"
+    echo "$WORK/$1.json"
+}
+
 # ---------------------------------------------------------------------------
-# Auth: reuse the existing Cloud Shell Azure CLI session
+# Auth: reuse the existing Cloud Shell Azure CLI session. The token is cached
+# in a file (so refreshes made inside $(...) subshells persist) and refreshed
+# shortly before expiry, so long runs on large tenants don't hit 401s.
 # ---------------------------------------------------------------------------
+TOKEN_FILE="$WORK/token"
+TOKEN_EXP_FILE="$WORK/token_exp"
+
+refresh_token() {
+    local args=(account get-access-token --resource https://graph.microsoft.com -o json) out
+    [[ -n "$TENANT" ]] && args+=(--tenant "$TENANT")
+    out=$(az "${args[@]}") || return 1
+    jq -r '.accessToken' <<<"$out" > "$TOKEN_FILE"
+    jq -r '.expires_on // empty' <<<"$out" > "$TOKEN_EXP_FILE"
+}
+
+auth_header() {
+    local exp now
+    now=$(date +%s)
+    exp=$(cat "$TOKEN_EXP_FILE" 2>/dev/null || true)
+    # Older az versions don't return expires_on; assume a 45-minute lifetime.
+    [[ "$exp" =~ ^[0-9]+$ ]] || exp=$(( $(stat -c %Y "$TOKEN_FILE") + 2700 ))
+    if (( exp - now < 300 )); then
+        refresh_token || true
+    fi
+    printf 'Authorization: Bearer %s' "$(cat "$TOKEN_FILE")"
+}
+
+# GET a Graph URL, writing the body to stdout. Retries throttling (429) and
+# transient failures (5xx / network) with Retry-After or exponential backoff,
+# and refreshes the token once on 401. Any other non-2xx returns non-zero so
+# callers can degrade gracefully (e.g. 403 for a missing permission).
+graph_get() {
+    local url="$1" attempt=0 refreshed=0 code wait hdr body
+    hdr=$(mktemp -p "$WORK"); body=$(mktemp -p "$WORK")
+    while :; do
+        code=$(curl -s -o "$body" -D "$hdr" -w '%{http_code}' -H "$(auth_header)" "$url") || code=000
+        case "$code" in
+            2??)
+                cat "$body"; rm -f "$hdr" "$body"; return 0 ;;
+            401)
+                (( refreshed == 0 )) || break
+                refreshed=1
+                refresh_token || break ;;
+            429|500|502|503|504|000)
+                (( attempt < MAX_RETRIES )) || break
+                wait=$(awk 'tolower($1)=="retry-after:" {print $2+0}' "$hdr" | tail -n1)
+                [[ "$wait" =~ ^[0-9]+$ ]] && (( wait > 0 )) || wait=$(( 2 ** (attempt + 1) ))
+                (( wait <= 120 )) || wait=120
+                echo "  Graph returned HTTP $code; retrying in ${wait}s (attempt $((attempt + 1))/${MAX_RETRIES})..." >&2
+                sleep "$wait"
+                attempt=$((attempt + 1)) ;;
+            *)
+                break ;;
+        esac
+    done
+    rm -f "$hdr" "$body"
+    return 1
+}
+
 echo "Getting Microsoft Graph access token from existing Azure CLI session..."
-TOKEN=$(az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv)
-AUTH="Authorization: Bearer $TOKEN"
+if ! refresh_token; then
+    echo "ERROR: could not get a Microsoft Graph token from the Azure CLI session." >&2
+    if [[ -n "$TENANT" ]]; then
+        echo "Sign in to the target tenant first, then re-run:" >&2
+        echo "  az login --tenant $TENANT --allow-no-subscriptions --use-device-code" >&2
+    fi
+    exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # Org / tenant info
 # ---------------------------------------------------------------------------
-ORG=$(curl -sf -H "$AUTH" 'https://graph.microsoft.com/v1.0/organization')
+if ! ORG=$(graph_get 'https://graph.microsoft.com/v1.0/organization'); then
+    echo "ERROR: could not read the tenant's organization info from Microsoft Graph." >&2
+    exit 1
+fi
 TENANT_NAME=$(jq -r '.value[0].displayName' <<<"$ORG")
 TENANT_ID=$(jq -r '.value[0].id' <<<"$ORG")
 TENANT_TAG=$(echo "$TENANT_NAME" | tr -c 'A-Za-z0-9' '_' | sed 's/__*/_/g; s/^_//; s/_$//')
@@ -91,6 +172,10 @@ FINDINGS_CSV="$OUTPUT_DIR/M365_SecurityFindings_${TENANT_TAG}_${TIMESTAMP}.csv"
 ZIP_PATH="$OUTPUT_DIR/M365_Assessment_${TENANT_TAG}_${TIMESTAMP}.zip"
 
 echo "Connected to: $TENANT_NAME  ($TENANT_ID)"
+if [[ "$TENANT" =~ ^[0-9a-fA-F-]{36}$ && "${TENANT,,}" != "${TENANT_ID,,}" ]]; then
+    echo "ERROR: requested tenant $TENANT but Graph returned $TENANT_ID; aborting." >&2
+    exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # SKU friendly-name map (GUID -> Product display name)
@@ -118,20 +203,36 @@ PY
     fi
     rm -f "$SKU_CSV_TMP"
 fi
+MAP_FILE=$(jfile skumap "$SKU_MAP_JSON")
+
+# Graph timestamps can carry fractional seconds and +00:00 offsets, neither of
+# which jq's fromdateiso8601 accepts. Normalize to YYYY-MM-DDTHH:MM:SSZ first.
+JQ_EPOCH='def to_epoch: sub("\\.[0-9]+"; "") | sub("(Z|[+-]00:00)$"; "") | . + "Z" | fromdateiso8601;'
 
 # ---------------------------------------------------------------------------
-# Paginated GET — accumulates .value across @odata.nextLink pages
+# Paginated GET — accumulates .value across @odata.nextLink pages. Pages are
+# staged on disk and merged in one jq pass (no per-page argv growth). Optional
+# second arg caps the page count; hitting the cap touches $WORK/truncated.
 # ---------------------------------------------------------------------------
 get_all_pages() {
-    local url="$1"
-    local merged='[]'
+    local url="$1" max_pages="${2:-0}" n=0 dir
+    dir=$(mktemp -d -p "$WORK")
+    rm -f "$WORK/truncated"
     while [[ -n "$url" && "$url" != "null" ]]; do
-        local page
-        page=$(curl -sf -H "$AUTH" "$url") || return 1
-        merged=$(jq -c --argjson m "$merged" '$m + .value' <<<"$page") || return 1
-        url=$(jq -r '."@odata.nextLink" // empty' <<<"$page")
+        if (( max_pages > 0 && n >= max_pages )); then
+            touch "$WORK/truncated"
+            break
+        fi
+        graph_get "$url" > "$dir/$(printf '%06d' "$n").json" || { rm -rf "$dir"; return 1; }
+        url=$(jq -r '."@odata.nextLink" // empty' < "$dir/$(printf '%06d' "$n").json") || { rm -rf "$dir"; return 1; }
+        n=$((n + 1))
     done
-    echo "$merged"
+    if (( n == 0 )); then
+        echo '[]'
+    else
+        jq -c -n '[inputs | .value[]?]' "$dir"/*.json || { rm -rf "$dir"; return 1; }
+    fi
+    rm -rf "$dir"
 }
 
 # ---------------------------------------------------------------------------
@@ -150,7 +251,7 @@ SUBS_AVAILABLE=0
 # that case renewal columns will simply be blank.
 for SUBS_URL in 'https://graph.microsoft.com/v1.0/directory/subscriptions' \
                 'https://graph.microsoft.com/beta/directory/subscriptions'; do
-    if SUBS_TRY=$(get_all_pages "$SUBS_URL" 2>/dev/null); then
+    if SUBS_TRY=$(get_all_pages "$SUBS_URL"); then
         SUBS_LIST="$SUBS_TRY"
         SUBS_AVAILABLE=1
         echo "Loaded $(jq 'length' <<<"$SUBS_LIST") subscriptions from ${SUBS_URL##*/com}."
@@ -166,10 +267,11 @@ fi
 # derived products) get an "orphan" row with blank renewal fields, so the
 # CSV remains a complete inventory.
 jq -n -r \
-    --argjson skus "$SKUS" \
-    --argjson subs "$SUBS_LIST" \
-    --argjson map  "$SKU_MAP_JSON" \
-    --argjson now  "$NOW_EPOCH" '
+    --slurpfile skus "$(jfile skus "$SKUS")" \
+    --slurpfile subs "$(jfile subs "$SUBS_LIST")" \
+    --slurpfile map  "$MAP_FILE" \
+    --argjson now  "$NOW_EPOCH" "$JQ_EPOCH"'
+    $skus[0] as $skus | $subs[0] as $subs | $map[0] as $map |
     ($skus | map({(.skuId): .}) | add // {}) as $sku_by_id |
     ($subs | map(.skuId)) as $sub_skus |
 
@@ -177,7 +279,7 @@ jq -n -r \
     # Average month = 365.25/12 days = 2629800 seconds. Negative => overdue.
     def months_until($iso):
         if ($iso == null or $iso == "") then null
-        else ((($iso | fromdateiso8601) - $now) / 2629800 * 10 | round / 10)
+        else ((($iso | to_epoch) - $now) / 2629800 * 10 | round / 10)
         end;
 
     def header: [
@@ -239,8 +341,8 @@ PROPS_BASE='id,userPrincipalName,displayName,givenName,surname,mail,userType,acc
 PROPS_FULL="${PROPS_BASE},signInActivity"
 
 SIGNIN_AVAILABLE=1
-if ! USERS=$(get_all_pages "https://graph.microsoft.com/v1.0/users?\$select=${PROPS_FULL}&\$top=999" 2>/dev/null); then
-    echo "WARNING: signInActivity unavailable (no AuditLog.Read.All consent); retrying without it." >&2
+if ! USERS=$(get_all_pages "https://graph.microsoft.com/v1.0/users?\$select=${PROPS_FULL}&\$top=999"); then
+    echo "WARNING: signInActivity unavailable (needs AuditLog.Read.All consent and Entra ID P1); retrying without it." >&2
     SIGNIN_AVAILABLE=0
     USERS=$(get_all_pages "https://graph.microsoft.com/v1.0/users?\$select=${PROPS_BASE}&\$top=999")
 fi
@@ -250,11 +352,13 @@ CUTOFF_EPOCH=$((NOW_EPOCH - STALE_DAYS * 86400))
 USERS_FILE=$(mktemp)
 echo "$USERS" > "$USERS_FILE"
 
-# Shared jq prelude: functions used by both the full user CSV and the stale subset.
+# Shared jq prelude: functions used by both the full user CSV and the stale
+# subset. Callers must pass --slurpfile map "$MAP_FILE" and --argjson now.
 read -r -d '' JQ_PRELUDE <<'JQ' || true
+$map[0] as $map |
 def days_since($iso):
     if ($iso == null or $iso == "") then null
-    else (($now - ($iso | fromdateiso8601)) / 86400 | floor)
+    else (($now - ($iso | to_epoch)) / 86400 | floor)
     end;
 def most_recent:
     [ .signInActivity.lastSignInDateTime,
@@ -289,8 +393,10 @@ def header: [
     "DaysSinceLastActivity","UserId"
 ];
 JQ
+JQ_PRELUDE="${JQ_EPOCH}
+${JQ_PRELUDE}"
 
-jq -r --argjson map "$SKU_MAP_JSON" --argjson now "$NOW_EPOCH" "
+jq -r --slurpfile map "$MAP_FILE" --argjson now "$NOW_EPOCH" "
 $JQ_PRELUDE
 header, (.[] | project) | @csv
 " < "$USERS_FILE" > "$USERS_CSV"
@@ -301,7 +407,7 @@ echo "Wrote $TOTAL_USERS user rows -> $USERS_CSV"
 # ---------------------------------------------------------------------------
 # Stale users (enabled members past the threshold, or never signed in & old)
 # ---------------------------------------------------------------------------
-jq -r --argjson map "$SKU_MAP_JSON" --argjson now "$NOW_EPOCH" --argjson stale "$STALE_DAYS" --argjson cutoff "$CUTOFF_EPOCH" "
+jq -r --slurpfile map "$MAP_FILE" --argjson now "$NOW_EPOCH" --argjson stale "$STALE_DAYS" --argjson cutoff "$CUTOFF_EPOCH" "
 $JQ_PRELUDE
 def is_stale:
     (.accountEnabled == true)
@@ -311,7 +417,7 @@ def is_stale:
         (\$d != null and \$d >= \$stale)
         or
         (\$d == null and (.createdDateTime != null) and (.createdDateTime != \"\")
-            and (.createdDateTime | fromdateiso8601) < \$cutoff)
+            and (.createdDateTime | to_epoch) < \$cutoff)
     );
 header, (.[] | select(is_stale) | project) | @csv
 " < "$USERS_FILE" > "$STALE_CSV"
@@ -348,14 +454,14 @@ echo "Running security review..."
 # --- Conditional Access policies + security defaults ---
 echo "Collecting Conditional Access policies..."
 CA_POLICIES='[]'
-if CA_TRY=$(get_all_pages 'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies?$top=999' 2>/dev/null); then
+if CA_TRY=$(get_all_pages 'https://graph.microsoft.com/v1.0/identity/conditionalAccess/policies?$top=999'); then
     CA_POLICIES="$CA_TRY"
     CA_AVAILABLE=1
 else
     echo "WARNING: could not read Conditional Access policies (requires Policy.Read.All); skipping." >&2
 fi
 
-if SECDEFAULTS_JSON=$(curl -sf -H "$AUTH" 'https://graph.microsoft.com/v1.0/policies/identitySecurityDefaultsEnforcementPolicy' 2>/dev/null); then
+if SECDEFAULTS_JSON=$(graph_get 'https://graph.microsoft.com/v1.0/policies/identitySecurityDefaultsEnforcementPolicy'); then
     SECDEFAULTS_ENABLED=$(jq -r '.isEnabled' <<<"$SECDEFAULTS_JSON")
 else
     echo "WARNING: could not read the security defaults policy (requires Policy.Read.All)." >&2
@@ -382,7 +488,7 @@ echo "Wrote $(($(wc -l < "$CA_CSV") - 1)) Conditional Access policy rows -> $CA_
 # --- Privileged directory role assignments ---
 echo "Collecting privileged role assignments..."
 ROLE_ASSIGNMENTS='[]'
-if ROLE_TRY=$(get_all_pages 'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$expand=principal($select=id,displayName,userPrincipalName,userType,accountEnabled),roleDefinition&$top=999' 2>/dev/null); then
+if ROLE_TRY=$(get_all_pages 'https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?$expand=principal($select=id,displayName,userPrincipalName,userType,accountEnabled),roleDefinition&$top=999'); then
     ROLE_ASSIGNMENTS="$ROLE_TRY"
     ROLES_AVAILABLE=1
 else
@@ -416,7 +522,7 @@ GA_COUNT=$(jq '[.[] | select(.roleDefinition.displayName=="Global Administrator"
 echo "Collecting authentication method registration details..."
 MFA_FILE=$(mktemp)
 echo '[]' > "$MFA_FILE"
-if MFA_TRY=$(get_all_pages 'https://graph.microsoft.com/v1.0/reports/authenticationMethods/userRegistrationDetails?$top=999' 2>/dev/null); then
+if MFA_TRY=$(get_all_pages 'https://graph.microsoft.com/v1.0/reports/authenticationMethods/userRegistrationDetails?$top=999'); then
     echo "$MFA_TRY" > "$MFA_FILE"
     MFA_AVAILABLE=1
 else
@@ -439,15 +545,16 @@ rm -f "$MFA_FILE"
 
 # --- Guest users (derived from the already-fetched user list, no extra call) ---
 echo "Collecting guest users..."
-jq -r --argjson map "$SKU_MAP_JSON" --argjson now "$NOW_EPOCH" "
+jq -r --slurpfile map "$MAP_FILE" --argjson now "$NOW_EPOCH" "
 $JQ_PRELUDE
 header, (.[] | select(.userType == \"Guest\") | project) | @csv
 " < "$USERS_FILE" > "$GUESTS_CSV"
 echo "Wrote $(($(wc -l < "$GUESTS_CSV") - 1)) guest user rows -> $GUESTS_CSV"
 
 PRIV_UPNS_JSON=$(jq -c '[.[] | .principal.userPrincipalName // empty] | unique' <<<"$ROLE_ASSIGNMENTS")
-STALE_ADMINS=$(jq -c --argjson upns "$PRIV_UPNS_JSON" --argjson now "$NOW_EPOCH" --argjson stale "$STALE_DAYS" "
+STALE_ADMINS=$(jq -c --slurpfile map "$MAP_FILE" --slurpfile upns "$(jfile privupns "$PRIV_UPNS_JSON")" --argjson now "$NOW_EPOCH" --argjson stale "$STALE_DAYS" "
 $JQ_PRELUDE
+\$upns[0] as \$upns |
 [ .[]
   | select(.userPrincipalName as \$u | \$upns | index(\$u) != null)
   | . as \$row
@@ -471,20 +578,11 @@ if [[ $SIGNIN_AVAILABLE -eq 1 ]]; then
     LEGACY_URL="https://graph.microsoft.com/v1.0/auditLogs/signIns?\$filter=${LEGACY_FILTER_ENC}&\$select=userPrincipalName,userDisplayName,appDisplayName,clientAppUsed,ipAddress,createdDateTime,status&\$top=999"
 
     LEGACY_MERGED='[]'
-    LEGACY_PAGE_COUNT=0
     LEGACY_MAX_PAGES=25
-    url="$LEGACY_URL"
-    LEGACY_FETCH_OK=1
-    while [[ -n "$url" && "$url" != "null" && $LEGACY_PAGE_COUNT -lt $LEGACY_MAX_PAGES ]]; do
-        page=$(curl -sf -H "$AUTH" "$url") || { LEGACY_FETCH_OK=0; break; }
-        LEGACY_MERGED=$(jq -c --argjson m "$LEGACY_MERGED" '$m + .value' <<<"$page")
-        url=$(jq -r '."@odata.nextLink" // empty' <<<"$page")
-        LEGACY_PAGE_COUNT=$((LEGACY_PAGE_COUNT + 1))
-    done
-
-    if [[ $LEGACY_FETCH_OK -eq 1 ]]; then
+    if LEGACY_TRY=$(get_all_pages "$LEGACY_URL" "$LEGACY_MAX_PAGES"); then
+        LEGACY_MERGED="$LEGACY_TRY"
         LEGACYAUTH_AVAILABLE=1
-        if [[ -n "$url" && "$url" != "null" ]]; then
+        if [[ -e "$WORK/truncated" ]]; then
             echo "NOTE: legacy-auth sign-in scan hit the ${LEGACY_MAX_PAGES}-page cap; results are truncated. Narrow with --legacy-auth-days." >&2
         fi
     else
@@ -520,7 +618,7 @@ fi
 echo "Collecting OAuth app consent grants..."
 GRAPH_SP_APPID='00000003-0000-0000-c000-000000000000'
 GRAPH_SP_JSON='{}'
-if GRAPH_SP_TRY=$(curl -sf -H "$AUTH" "https://graph.microsoft.com/v1.0/servicePrincipals(appId='${GRAPH_SP_APPID}')?\$select=id,appRoles" 2>/dev/null); then
+if GRAPH_SP_TRY=$(graph_get "https://graph.microsoft.com/v1.0/servicePrincipals(appId='${GRAPH_SP_APPID}')?\$select=id,appRoles"); then
     GRAPH_SP_JSON="$GRAPH_SP_TRY"
 fi
 GRAPH_SP_ID=$(jq -r '.id // empty' <<<"$GRAPH_SP_JSON")
@@ -530,12 +628,12 @@ DEL_FILE=$(mktemp); echo '[]' > "$DEL_FILE"
 APPASSIGN_FILE=$(mktemp); echo '[]' > "$APPASSIGN_FILE"
 
 if [[ -n "$GRAPH_SP_ID" ]]; then
-    if SP_TRY=$(get_all_pages 'https://graph.microsoft.com/v1.0/servicePrincipals?$select=id,appId,displayName,publisherName,verifiedPublisher,appOwnerOrganizationId,signInAudience,passwordCredentials,keyCredentials&$top=999' 2>/dev/null); then
+    if SP_TRY=$(get_all_pages 'https://graph.microsoft.com/v1.0/servicePrincipals?$select=id,appId,displayName,publisherName,verifiedPublisher,appOwnerOrganizationId,signInAudience,passwordCredentials,keyCredentials&$top=999'); then
         echo "$SP_TRY" > "$SP_FILE"
-        if DEL_TRY=$(get_all_pages 'https://graph.microsoft.com/v1.0/oauth2PermissionGrants?$top=999' 2>/dev/null); then
+        if DEL_TRY=$(get_all_pages 'https://graph.microsoft.com/v1.0/oauth2PermissionGrants?$top=999'); then
             echo "$DEL_TRY" > "$DEL_FILE"
         fi
-        if APP_TRY=$(get_all_pages "https://graph.microsoft.com/v1.0/servicePrincipals/${GRAPH_SP_ID}/appRoleAssignedTo?\$top=999" 2>/dev/null); then
+        if APP_TRY=$(get_all_pages "https://graph.microsoft.com/v1.0/servicePrincipals/${GRAPH_SP_ID}/appRoleAssignedTo?\$top=999"); then
             echo "$APP_TRY" > "$APPASSIGN_FILE"
         fi
         OAUTH_AVAILABLE=1
@@ -546,16 +644,16 @@ if [[ $OAUTH_AVAILABLE -ne 1 ]]; then
     echo "WARNING: could not read service principals / OAuth grants (requires Directory.Read.All); skipping app consent review." >&2
 fi
 
-GRAPH_APP_ROLES_JSON=$(jq -c '.appRoles // []' <<<"$GRAPH_SP_JSON")
+GRAPH_ROLES_FILE=$(jfile graphroles "$(jq -c '.appRoles // []' <<<"$GRAPH_SP_JSON")")
 
 jq -r --slurpfile sp "$SP_FILE" --slurpfile delegated "$DEL_FILE" --slurpfile appassignments "$APPASSIGN_FILE" \
-      --argjson graphroles "$GRAPH_APP_ROLES_JSON" --argjson now "$NOW_EPOCH" --argjson hr "$HIGH_RISK_PERMS_JSON" '
+      --slurpfile graphroles "$GRAPH_ROLES_FILE" --argjson now "$NOW_EPOCH" --argjson hr "$HIGH_RISK_PERMS_JSON" "$JQ_EPOCH"'
 def is_ms_owned: (.appOwnerOrganizationId // "") == "f8cdef31-a31e-4b4a-93e4-5f571e91255a";
 def cred_count: ((.passwordCredentials // []) | length) + ((.keyCredentials // []) | length);
-def has_expired_cred($now): ([(.passwordCredentials // [])[], (.keyCredentials // [])[]] | map(select(.endDateTime != null and (.endDateTime | fromdateiso8601) < $now)) | length) > 0;
+def has_expired_cred($now): ([(.passwordCredentials // [])[], (.keyCredentials // [])[]] | map(select(.endDateTime != null and (.endDateTime | to_epoch) < $now)) | length) > 0;
 
 ($sp[0] // [] | map({(.id): .}) | add // {}) as $sp_by_id |
-($graphroles // [] | map({(.id): .value}) | add // {}) as $role_by_id |
+($graphroles[0] // [] | map({(.id): .value}) | add // {}) as $role_by_id |
 
 def client_fields($spId):
     ($sp_by_id[$spId] // {}) as $c | [
@@ -589,10 +687,10 @@ header,
 echo "Wrote $(($(wc -l < "$OAUTH_CSV") - 1)) OAuth consent rows -> $OAUTH_CSV"
 
 OAUTH_RISKY=$(jq -c --slurpfile sp "$SP_FILE" --slurpfile delegated "$DEL_FILE" --slurpfile appassignments "$APPASSIGN_FILE" \
-      --argjson graphroles "$GRAPH_APP_ROLES_JSON" --argjson hr "$HIGH_RISK_PERMS_JSON" '
+      --slurpfile graphroles "$GRAPH_ROLES_FILE" --argjson hr "$HIGH_RISK_PERMS_JSON" '
 def is_ms_owned: (.appOwnerOrganizationId // "") == "f8cdef31-a31e-4b4a-93e4-5f571e91255a";
 ($sp[0] // [] | map({(.id): .}) | add // {}) as $sp_by_id |
-($graphroles // [] | map({(.id): .value}) | add // {}) as $role_by_id |
+($graphroles[0] // [] | map({(.id): .value}) | add // {}) as $role_by_id |
 [
   (($appassignments[0] // [])[] | . as $a | ($sp_by_id[$a.principalId] // {}) as $c |
     select(($c | is_ms_owned) | not) |
@@ -609,8 +707,8 @@ def is_ms_owned: (.appOwnerOrganizationId // "") == "f8cdef31-a31e-4b4a-93e4-5f5
 ]
 ' <<< 'null')
 
-EXPIRED_CRED_APPS=$(jq -c --slurpfile sp "$SP_FILE" --argjson now "$NOW_EPOCH" '
-[ $sp[0][]? | select( ([(.passwordCredentials // [])[], (.keyCredentials // [])[]] | map(select(.endDateTime != null and (.endDateTime | fromdateiso8601) < $now)) | length) > 0 ) | .displayName ] | unique
+EXPIRED_CRED_APPS=$(jq -c --slurpfile sp "$SP_FILE" --argjson now "$NOW_EPOCH" "$JQ_EPOCH"'
+[ $sp[0][]? | select( ([(.passwordCredentials // [])[], (.keyCredentials // [])[]] | map(select(.endDateTime != null and (.endDateTime | to_epoch) < $now)) | length) > 0 ) | .displayName ] | unique
 ' <<< 'null')
 
 rm -f "$SP_FILE" "$DEL_FILE" "$APPASSIGN_FILE"
@@ -618,7 +716,7 @@ rm -f "$SP_FILE" "$DEL_FILE" "$APPASSIGN_FILE"
 # --- Identity Protection risky users ---
 echo "Collecting Identity Protection risky users..."
 RISKY_USERS='[]'
-if RISKY_TRY=$(get_all_pages 'https://graph.microsoft.com/v1.0/identityProtection/riskyUsers?$top=500' 2>/dev/null); then
+if RISKY_TRY=$(get_all_pages 'https://graph.microsoft.com/v1.0/identityProtection/riskyUsers?$top=500'); then
     RISKY_USERS="$RISKY_TRY"
     RISKYUSERS_AVAILABLE=1
 else
@@ -635,7 +733,7 @@ echo "Wrote $(($(wc -l < "$RISKYUSERS_CSV") - 1)) risky-user rows -> $RISKYUSERS
 # --- Secure Score ---
 echo "Collecting Secure Score..."
 SECURE_SCORE_ALL='[]'
-if SS_TRY=$(get_all_pages 'https://graph.microsoft.com/v1.0/security/secureScores?$top=999' 2>/dev/null); then
+if SS_TRY=$(get_all_pages 'https://graph.microsoft.com/v1.0/security/secureScores?$top=999'); then
     SECURE_SCORE_ALL="$SS_TRY"
     SECURESCORE_AVAILABLE=1
 else
@@ -644,11 +742,11 @@ fi
 SECURE_SCORE_LATEST=$(jq -c '(sort_by(.createdDateTime) | last) // {}' <<<"$SECURE_SCORE_ALL")
 SCORE_PROFILES='[]'
 if [[ $SECURESCORE_AVAILABLE -eq 1 ]]; then
-    SP_TRY2=$(get_all_pages 'https://graph.microsoft.com/v1.0/security/secureScoreControlProfiles?$top=999' 2>/dev/null) && SCORE_PROFILES="$SP_TRY2"
+    SP_TRY2=$(get_all_pages 'https://graph.microsoft.com/v1.0/security/secureScoreControlProfiles?$top=999') && SCORE_PROFILES="$SP_TRY2"
 fi
 
-jq -r --argjson profiles "$SCORE_PROFILES" '
-($profiles | map({(.id): .}) | add // {}) as $p_by_id |
+jq -r --slurpfile profiles "$(jfile scoreprofiles "$SCORE_PROFILES")" '
+($profiles[0] | map({(.id): .}) | add // {}) as $p_by_id |
 (.controlScores // []) as $scores |
 def header: ["ControlName","Title","Category","CurrentScore","MaxScore","PercentImplemented","Rank","Tier","UserImpact","ImplementationCost","ActionType","Remediation","RemediationImpact"];
 def row:
@@ -671,9 +769,17 @@ SECDEFAULTS_BOOL="null"
 [[ "$SECDEFAULTS_ENABLED" == "true" ]] && SECDEFAULTS_BOOL="true"
 [[ "$SECDEFAULTS_ENABLED" == "false" ]] && SECDEFAULTS_BOOL="false"
 
-jq -r --argjson secdefaults "$SECDEFAULTS_BOOL" --argjson ca "$CA_POLICIES" --argjson roles "$ROLE_ASSIGNMENTS" \
-      --argjson noMfaAdmins "$NO_MFA_ADMINS" --argjson staleAdmins "$STALE_ADMINS" --argjson legacyAgg "$LEGACY_AGG" \
-      --argjson oauthRisky "$OAUTH_RISKY" --argjson expiredCredApps "$EXPIRED_CRED_APPS" --argjson riskyUsers "$RISKY_USERS" '
+jq -r --argjson secdefaults "$SECDEFAULTS_BOOL" \
+      --slurpfile ca "$(jfile f_ca "$CA_POLICIES")" \
+      --slurpfile roles "$(jfile f_roles "$ROLE_ASSIGNMENTS")" \
+      --slurpfile noMfaAdmins "$(jfile f_nomfa "$NO_MFA_ADMINS")" \
+      --slurpfile staleAdmins "$(jfile f_staleadmins "$STALE_ADMINS")" \
+      --slurpfile legacyAgg "$(jfile f_legacy "$LEGACY_AGG")" \
+      --slurpfile oauthRisky "$(jfile f_oauth "$OAUTH_RISKY")" \
+      --slurpfile expiredCredApps "$(jfile f_expired "$EXPIRED_CRED_APPS")" \
+      --slurpfile riskyUsers "$(jfile f_risky "$RISKY_USERS")" '
+$ca[0] as $ca | $roles[0] as $roles | $noMfaAdmins[0] as $noMfaAdmins | $staleAdmins[0] as $staleAdmins |
+$legacyAgg[0] as $legacyAgg | $oauthRisky[0] as $oauthRisky | $expiredCredApps[0] as $expiredCredApps | $riskyUsers[0] as $riskyUsers |
 def sev($s;$cat;$find;$obj;$rec): {severity:$s, category:$cat, finding:$find, affected:$obj, recommendation:$rec};
 
 ( if ($secdefaults == false) and (($ca // []) | map(select(.state=="enabled")) | length) == 0 then

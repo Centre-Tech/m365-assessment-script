@@ -46,6 +46,7 @@ curl -s https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/
 
 | Flag | Default | Notes |
 | --- | --- | --- |
+| `--tenant ID\|DOMAIN`    | current session | Target tenant for the Graph token. Use when assessing a customer tenant via a partner (GDAP) account; run `az login --tenant <ID> --allow-no-subscriptions --use-device-code` first. If a GUID is given, the script aborts if Graph reports a different tenant. |
 | `--stale-days N`         | `90`        | Inactivity threshold for the stale-users CSV. |
 | `--output-dir PATH`      | `$HOME`     | Where the CSVs / zip are written. |
 | `--skip-friendly-names`  | off         | Skip downloading Microsoft's SKU friendly-name map; CSV keeps raw `SkuPartNumber` values. |
@@ -61,6 +62,8 @@ curl -s https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/
 - `signInActivity` on user rows, MFA registration details, and the legacy-auth scan require `AuditLog.Read.All` consent on the Azure CLI app. If it's not granted, those exports still produce successfully but the relevant columns/CSVs are blank, and the stale list falls back to a created-date heuristic.
 - Risky users (`M365_RiskyUsers_*.csv`) require an **Entra ID P2** license — on P1/free tenants the CSV is written with headers only.
 - Every security-review sub-check degrades gracefully: if the signed-in account lacks the Graph permission for it, the script prints a warning, writes a header-only CSV, and continues rather than aborting.
+- Large tenants: Graph throttling (HTTP 429) and transient 5xx errors are retried automatically (honoring `Retry-After`), and the Graph token is refreshed before it expires, so long runs complete unattended.
+- Always check the `Connected to:` line at the start of the run. If you're signed in with a partner account, Cloud Shell may be pointed at your home tenant rather than the customer's; use `--tenant`.
 
 ## Running locally
 
