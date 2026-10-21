@@ -99,6 +99,19 @@ EXT_TOKEN_FILE="$WORK/ext_token"
 EXT_EXP_FILE="$WORK/ext_token_exp"
 EXT_REFRESH_FILE="$WORK/ext_refresh"
 
+# Azure Resource Manager token (same Cloud Shell session) for the Billing API,
+# used only to map license subscriptions to billing accounts (GRAPH_AUTH_MODE=arm).
+ARM_TOKEN_FILE="$WORK/arm_token"
+ARM_EXP_FILE="$WORK/arm_token_exp"
+
+arm_token() {
+    local args=(account get-access-token --resource https://management.azure.com -o json) out
+    [[ -n "$TENANT" ]] && args+=(--tenant "$TENANT")
+    out=$(az "${args[@]}" 2>/dev/null) || return 1
+    jq -e -r '.accessToken' <<<"$out" > "$ARM_TOKEN_FILE" || return 1
+    jq -r '.expires_on // empty' <<<"$out" > "$ARM_EXP_FILE"
+}
+
 ext_store() {
     jq -e -r '.access_token' <<<"$1" > "$EXT_TOKEN_FILE" || return 1
     echo $(( $(date +%s) + $(jq -r '.expires_in // 3600' <<<"$1") )) > "$EXT_EXP_FILE"
@@ -161,6 +174,14 @@ refresh_token() {
 auth_header() {
     local exp now
     now=$(date +%s)
+    if [[ "$GRAPH_AUTH_MODE" == arm ]]; then
+        exp=$(cat "$ARM_EXP_FILE" 2>/dev/null || echo 0)
+        if (( exp - now < 300 )); then
+            arm_token || true
+        fi
+        printf 'Authorization: Bearer %s' "$(cat "$ARM_TOKEN_FILE")"
+        return
+    fi
     if [[ "$GRAPH_AUTH_MODE" == ext ]]; then
         exp=$(cat "$EXT_EXP_FILE" 2>/dev/null || echo 0)
         if (( exp - now < 300 )); then
@@ -195,6 +216,8 @@ graph_get() {
                 refreshed=1
                 if [[ "$GRAPH_AUTH_MODE" == ext ]]; then
                     ext_refresh || break
+                elif [[ "$GRAPH_AUTH_MODE" == arm ]]; then
+                    arm_token || break
                 else
                     refresh_token || break
                 fi ;;
@@ -314,7 +337,7 @@ get_all_pages() {
             break
         fi
         graph_get "$url" > "$dir/$(printf '%06d' "$n").json" || { rm -rf "$dir"; return 1; }
-        url=$(jq -r '."@odata.nextLink" // empty' < "$dir/$(printf '%06d' "$n").json") || { rm -rf "$dir"; return 1; }
+        url=$(jq -r '."@odata.nextLink" // .nextLink // empty' < "$dir/$(printf '%06d' "$n").json") || { rm -rf "$dir"; return 1; }
         n=$((n + 1))
     done
     if (( n == 0 )); then
@@ -352,6 +375,52 @@ if [[ $SUBS_AVAILABLE -ne 1 ]]; then
     echo "WARNING: could not read directory/subscriptions; renewal date column will be blank." >&2
 fi
 
+# --- Billing accounts (Azure Billing API via ARM) ---
+# Maps each license subscription to the billing account it's billed on. A
+# tenant can have several (e.g. two MCAs and a legacy MOSA). Subscriptions
+# bought through a CSP partner are billed by the partner, so they normally
+# won't appear in any customer billing account and are labeled accordingly.
+echo "Collecting billing accounts (Azure Billing API)..."
+BILLING_AVAILABLE=0
+BILLING_ACCOUNT_COUNT=0
+BILLING_SUBS_FILE="$WORK/billing_subs.json"
+echo '[]' > "$BILLING_SUBS_FILE"
+BILLING_API='https://management.azure.com/providers/Microsoft.Billing/billingAccounts'
+BILLING_VER='api-version=2024-04-01'
+if arm_token; then
+    GRAPH_AUTH_MODE=arm
+    if BILLING_ACCOUNTS=$(get_all_pages "${BILLING_API}?${BILLING_VER}&includeAll=true&includeResellee=true"); then
+        BILLING_AVAILABLE=1
+        BILLING_ACCOUNT_COUNT=$(jq 'length' <<<"$BILLING_ACCOUNTS")
+        echo "Found $BILLING_ACCOUNT_COUNT billing account(s)."
+        n=0
+        while IFS=$'\t' read -r ba_name ba_display ba_type; do
+            [[ -n "$ba_name" ]] || continue
+            extra="&expand=Reseller"
+            [[ "$ba_type" == "MicrosoftOnlineServicesProgram" ]] && extra="${extra}&includeTenantSubscriptions=true"
+            ba_url="${BILLING_API}/${ba_name}/billingSubscriptions?${BILLING_VER}"
+            if ! BA_SUBS=$(get_all_pages "${ba_url}${extra}"); then
+                BA_SUBS=$(get_all_pages "$ba_url") || {
+                    echo "WARNING: could not list subscriptions for billing account '$ba_display' ($ba_type)." >&2
+                    continue
+                }
+            fi
+            jq -c --arg n "$ba_display" --arg t "$ba_type" --arg id "$ba_name" \
+                'map(. + {_account: {displayName: $n, agreementType: $t, name: $id}})' <<<"$BA_SUBS" > "$WORK/billing_subs_$n.json"
+            echo "  $ba_display ($ba_type): $(jq 'length' <<<"$BA_SUBS") subscription(s)"
+            n=$((n + 1))
+        done < <(jq -r '.[] | [.name, (.properties.displayName // .name), (.properties.agreementType // "")] | @tsv' <<<"$BILLING_ACCOUNTS")
+        if (( n > 0 )); then
+            jq -c -s 'add' "$WORK"/billing_subs_*.json > "$BILLING_SUBS_FILE"
+        fi
+    else
+        echo "WARNING: could not list billing accounts (needs a billing role, Global Admin, or Global Reader); BillingAccount column will say Unknown." >&2
+    fi
+    GRAPH_AUTH_MODE=cli
+else
+    echo "WARNING: could not get an Azure Resource Manager token; BillingAccount column will say Unknown." >&2
+fi
+
 # Build combined input and emit one row per subscription, with SKU-level
 # consumption joined in. SKUs that have no matching subscription (free /
 # derived products) get an "orphan" row with blank renewal fields, so the
@@ -360,10 +429,13 @@ jq -n -r \
     --slurpfile skus "$(jfile skus "$SKUS")" \
     --slurpfile subs "$(jfile subs "$SUBS_LIST")" \
     --slurpfile map  "$MAP_FILE" \
+    --slurpfile billing "$BILLING_SUBS_FILE" \
+    --argjson billingAvailable "$BILLING_AVAILABLE" \
     --argjson now  "$NOW_EPOCH" "$JQ_EPOCH"'
-    $skus[0] as $skus | $subs[0] as $subs | $map[0] as $map |
+    $skus[0] as $skus | $subs[0] as $subs | $map[0] as $map | $billing[0] as $billing |
     ($skus | map({(.skuId): .}) | add // {}) as $sku_by_id |
     ($subs | map(.skuId)) as $sub_skus |
+    ($billing | map({(.name | ascii_downcase): .}) | add // {}) as $bill_by_id |
 
     # Approximate whole-and-fractional months until the given renewal date.
     # Average month = 365.25/12 days = 2629800 seconds. Negative => overdue.
@@ -372,12 +444,41 @@ jq -n -r \
         else ((($iso | to_epoch) - $now) / 2629800 * 10 | round / 10)
         end;
 
+    # Match by subscription GUID first; fall back to quantity + term end date.
+    def billing_match:
+        . as $s |
+        ([.commerceSubscriptionId, .id] | map(select(. != null) | ascii_downcase | $bill_by_id[.] // empty) | .[0])
+        // ([$billing[] | select((.properties.quantity // -1) == ($s.totalLicenses // -2)
+                                and ((.properties.termEndDate // "")[0:10]) == (($s.nextLifecycleDateTime // "x")[0:10]))]
+            | if length == 1 then .[0] else null end);
+
+    def agreement_label:
+        if . == "MicrosoftCustomerAgreement" then "MCA"
+        elif . == "MicrosoftOnlineServicesProgram" then "MOSA"
+        elif . == "MicrosoftPartnerAgreement" then "MPA (CSP)"
+        elif . == "EnterpriseAgreement" then "EA"
+        else (. // "") end;
+
+    def billing_cols:
+        billing_match as $b |
+        if $b != null then [
+            $b._account.displayName,
+            ($b._account.agreementType | agreement_label),
+            ($b.properties.billingProfileDisplayName // ""),
+            ($b.properties.reseller.description // ""),
+            ($b.properties.autoRenew // "")
+        ]
+        elif $billingAvailable == 1 then ["Not in a readable billing account (likely partner/CSP-billed)", "", "", "", ""]
+        else ["Unknown (billing API not accessible)", "", "", "", ""]
+        end;
+
     def header: [
         "ProductName","SkuPartNumber",
         "NextRenewalDate","MonthsUntilNextRenewal","SubscriptionStatus","IsTrial","SubscriptionCreatedDate",
         "SubscriptionLicenses",
         "SkuTotalLicenses","SkuConsumedLicenses","SkuAvailableLicenses",
-        "ServicePlans","CommerceSubscriptionId","SkuId","AppliesTo","CapabilityStatus"
+        "ServicePlans","CommerceSubscriptionId","SkuId","AppliesTo","CapabilityStatus",
+        "BillingAccount","BillingAgreementType","BillingProfile","Reseller","AutoRenew"
     ];
 
     def sub_row:
@@ -398,7 +499,7 @@ jq -n -r \
             .skuId,
             ($sku.appliesTo // ""),
             ($sku.capabilityStatus // "")
-        ];
+        ] + billing_cols;
 
     def sku_only_row: [
         ($map[.skuId] // .skuPartNumber),
@@ -409,7 +510,8 @@ jq -n -r \
         (.consumedUnits // 0),
         ((.prepaidUnits.enabled // 0) - (.consumedUnits // 0)),
         ([.servicePlans[]?.servicePlanName] | join(";")),
-        "", .skuId, (.appliesTo // ""), (.capabilityStatus // "")
+        "", .skuId, (.appliesTo // ""), (.capabilityStatus // ""),
+        "", "", "", "", ""
     ];
 
     header,
@@ -531,6 +633,7 @@ RISKYUSERS_AVAILABLE=0
 SECURESCORE_AVAILABLE=0
 SECDEFAULTS_ENABLED=""
 GA_COUNT=0
+GA_SP_COUNT=0
 SECURESCORE_CURRENT=""
 SECURESCORE_MAX=""
 TOTAL_FINDINGS=0
@@ -615,7 +718,8 @@ header, (.[] | row) | @csv
 ' <<<"$ROLE_ASSIGNMENTS" > "$ROLES_CSV"
 echo "Wrote $(($(wc -l < "$ROLES_CSV") - 1)) role assignment rows -> $ROLES_CSV"
 
-GA_COUNT=$(jq '[.[] | select(.roleDefinition.displayName=="Global Administrator") | .principalId] | unique | length' <<<"$ROLE_ASSIGNMENTS")
+GA_COUNT=$(jq '[.[] | select(.roleDefinition.displayName=="Global Administrator") | select((.principal."@odata.type" // "") | test("servicePrincipal") | not) | .principalId] | unique | length' <<<"$ROLE_ASSIGNMENTS")
+GA_SP_COUNT=$(jq '[.[] | select(.roleDefinition.displayName=="Global Administrator") | select((.principal."@odata.type" // "") | test("servicePrincipal")) | .principalId] | unique | length' <<<"$ROLE_ASSIGNMENTS")
 
 # --- MFA / authentication method registration ---
 echo "Collecting authentication method registration details..."
@@ -747,7 +851,7 @@ GRAPH_ROLES_FILE=$(jfile graphroles "$(jq -c '.appRoles // []' <<<"$GRAPH_SP_JSO
 
 jq -r --slurpfile sp "$SP_FILE" --slurpfile delegated "$DEL_FILE" --slurpfile appassignments "$APPASSIGN_FILE" \
       --slurpfile graphroles "$GRAPH_ROLES_FILE" --argjson now "$NOW_EPOCH" --argjson hr "$HIGH_RISK_PERMS_JSON" "$JQ_EPOCH"'
-def is_ms_owned: (.appOwnerOrganizationId // "") == "f8cdef31-a31e-4b4a-93e4-5f571e91255a";
+def is_ms_owned: ((.appOwnerOrganizationId // "") | IN("f8cdef31-a31e-4b4a-93e4-5f571e91255a", "72f988bf-86f1-41af-91ab-2d7cd011db47")) or ((.verifiedPublisher.displayName // "") == "Microsoft Corporation");
 def cred_count: ((.passwordCredentials // []) | length) + ((.keyCredentials // []) | length);
 def has_expired_cred($now): ([(.passwordCredentials // [])[], (.keyCredentials // [])[]] | map(select(.endDateTime != null and (.endDateTime | to_epoch) < $now)) | length) > 0;
 
@@ -787,7 +891,7 @@ echo "Wrote $(($(wc -l < "$OAUTH_CSV") - 1)) OAuth consent rows -> $OAUTH_CSV"
 
 OAUTH_RISKY=$(jq -c --slurpfile sp "$SP_FILE" --slurpfile delegated "$DEL_FILE" --slurpfile appassignments "$APPASSIGN_FILE" \
       --slurpfile graphroles "$GRAPH_ROLES_FILE" --argjson hr "$HIGH_RISK_PERMS_JSON" '
-def is_ms_owned: (.appOwnerOrganizationId // "") == "f8cdef31-a31e-4b4a-93e4-5f571e91255a";
+def is_ms_owned: ((.appOwnerOrganizationId // "") | IN("f8cdef31-a31e-4b4a-93e4-5f571e91255a", "72f988bf-86f1-41af-91ab-2d7cd011db47")) or ((.verifiedPublisher.displayName // "") == "Microsoft Corporation");
 ($sp[0] // [] | map({(.id): .}) | add // {}) as $sp_by_id |
 ($graphroles[0] // [] | map({(.id): .value}) | add // {}) as $role_by_id |
 [
@@ -795,13 +899,13 @@ def is_ms_owned: (.appOwnerOrganizationId // "") == "f8cdef31-a31e-4b4a-93e4-5f5
     select(($c | is_ms_owned) | not) |
     ($role_by_id[$a.appRoleId] // $a.appRoleId) as $perm |
     select($hr | index($perm) != null) |
-    {clientAppDisplayName: ($c.displayName // $a.principalId), permission: $perm, permissionType: "Application", consentType: "N/A"}
+    {clientId: $a.principalId, clientAppDisplayName: ($c.displayName // $a.principalId), permission: $perm, permissionType: "Application", consentType: "N/A"}
   ),
   (($delegated[0] // [])[] | . as $g | ($sp_by_id[$g.clientId] // {}) as $c |
     select(($c | is_ms_owned) | not) |
     (($g.scope // "") | split(" ") | map(select(length > 0)))[] as $perm |
     select($hr | index($perm) != null) |
-    {clientAppDisplayName: ($c.displayName // $g.clientId), permission: $perm, permissionType: "Delegated", consentType: $g.consentType}
+    {clientId: $g.clientId, clientAppDisplayName: ($c.displayName // $g.clientId), permission: $perm, permissionType: "Delegated", consentType: $g.consentType, principalId: $g.principalId}
   )
 ]
 ' <<< 'null')
@@ -895,12 +999,17 @@ def sev($s;$cat;$find;$obj;$rec): {severity:$s, category:$cat, finding:$find, af
 [ ($ca // [])[] | select(.state=="disabled")
   | sev("Medium";"Conditional Access";"Conditional Access policy is disabled"; .displayName; "Review and enable or remove the disabled policy") ] as $disabled_ca_findings |
 
-(($roles // []) | map(select(.roleDefinition.displayName=="Global Administrator")) | map(.principalId) | unique | length) as $ga_count |
+def is_sp: ((.principal."@odata.type" // "") | test("servicePrincipal"));
+(($roles // []) | map(select(.roleDefinition.displayName=="Global Administrator"))) as $ga_assignments |
+($ga_assignments | map(select(is_sp | not) | .principalId) | unique | length) as $ga_count |
 ( if $ga_count == 1 then
     [sev("High";"Privileged Roles";"Only one Global Administrator account exists (no break-glass redundancy)"; "Tenant"; "Provision at least one additional break-glass Global Administrator account")]
   elif $ga_count > 5 then
     [sev("Medium";"Privileged Roles";("Large number of Global Administrators (" + ($ga_count|tostring) + ")"); "Tenant"; "Review Global Administrator membership and remove unnecessary assignments")]
   else [] end ) as $ga_findings |
+
+[ $ga_assignments[] | select(is_sp)
+  | sev("High";"Privileged Roles";"Service principal (application) holds the Global Administrator role"; (.principal.displayName // .principalId); "Confirm the app owner and purpose; replace Global Administrator with least-privilege roles or Graph permissions") ] as $sp_ga_findings |
 
 [ ($roles // [])[] | select(.principal.userType=="Guest")
   | sev("High";"Privileged Roles";"Guest account holds a privileged directory role"; (.principal.userPrincipalName // .principalId); ("Remove the " + (.roleDefinition.displayName // .roleDefinitionId) + " assignment or convert to a managed member account")) ] as $guest_admin_findings |
@@ -915,27 +1024,46 @@ def sev($s;$cat;$find;$obj;$rec): {severity:$s, category:$cat, finding:$find, af
     [sev("Medium";"Legacy Authentication";(($legacyAgg | length | tostring) + " distinct user/app combinations used legacy (basic) authentication in the lookback window"); "Tenant"; "Block legacy authentication with a Conditional Access policy")]
   else [] end ) as $legacy_findings |
 
-[ ($oauthRisky // [])[]
-  | sev( (if .permissionType=="Delegated" and .consentType=="Principal" then "High" else "Medium" end);
+# One row per app (not per permission or consenting user), listing its
+# high-risk permissions, admin consent, and how many users consented.
+[ ($oauthRisky // []) | group_by(.clientId // .clientAppDisplayName)[]
+  | ([.[] | select(.permissionType=="Application") | .permission] | unique) as $appPerms
+  | ([.[] | select(.permissionType=="Delegated") | .permission] | unique) as $delPerms
+  | (map(select(.consentType=="AllPrincipals")) | length > 0) as $admin
+  | (map(select(.consentType=="Principal") | .principalId) | unique | length) as $users
+  | (($appPerms | length) + ($delPerms | length)) as $n
+  | sev( (if $users > 0 then "High" else "Medium" end);
          "OAuth Consent";
-         ("High-risk " + .permissionType + " permission (" + .permission + ") granted to third-party app");
-         .clientAppDisplayName;
+         ("Third-party app holds " + ($n|tostring) + " high-risk permission" + (if $n == 1 then "" else "s" end) + ". "
+           + ([ (if ($appPerms | length) > 0 then "Application: " + ($appPerms | join(", ")) else empty end),
+                (if ($delPerms | length) > 0 then
+                    "Delegated: " + ($delPerms | join(", "))
+                    + ([ (if $admin then "admin consent for all users" else empty end),
+                         (if $users > 0 then ("consented by " + ($users|tostring) + " user" + (if $users == 1 then "" else "s" end)) else empty end)
+                       ] | if length > 0 then " (" + join("; ") + ")" else "" end)
+                 else empty end)
+              ] | join("; ")));
+         .[0].clientAppDisplayName;
          "Review app consent in Enterprise Applications and revoke if unnecessary" ) ] as $oauth_findings |
 
 [ ($expiredCredApps // [])[]
   | sev("Low";"App Credentials";"App registration has an expired credential still present"; .; "Remove the expired client secret/certificate") ] as $expired_cred_findings |
 
 [ ($riskyUsers // [])[] | select(.riskState=="atRisk" or .riskState=="confirmedCompromised")
-  | sev( (if .riskLevel=="high" then "High" else "Medium" end);
-         "Identity Protection"; ("User flagged as risky: " + (.riskDetail // "unspecified")); (.userPrincipalName // .userDisplayName); "Investigate in Entra ID Protection and remediate or confirm compromise" ) ] as $risky_user_findings |
+  | sev( (if .riskState=="confirmedCompromised" or .riskLevel=="high" then "High" elif .riskLevel=="medium" then "Medium" else "Low" end);
+         "Identity Protection";
+         (if .riskState=="confirmedCompromised" then "User confirmed compromised"
+          else "User at " + (.riskLevel // "unknown") + " risk (" + .riskState + ")" end
+           + (if (.riskDetail // "none") != "none" then "; " + .riskDetail else "" end));
+         (.userPrincipalName // .userDisplayName); "Investigate in Entra ID Protection and remediate or confirm compromise" ) ] as $risky_user_findings |
 
-($baseline_findings + $disabled_ca_findings + $ga_findings + $guest_admin_findings + $no_mfa_findings +
+($baseline_findings + $disabled_ca_findings + $ga_findings + $sp_ga_findings + $guest_admin_findings + $no_mfa_findings +
  $stale_admin_findings + $legacy_findings + $oauth_findings + $expired_cred_findings + $risky_user_findings) as $all |
 
 def sevrank: if .severity=="High" then 0 elif .severity=="Medium" then 1 else 2 end;
 
 (["Severity","Category","Finding","AffectedObject","Recommendation"]),
-($all | sort_by(sevrank) | .[] | [.severity, .category, .finding, .affected, .recommendation])
+($all | sort_by([sevrank, .category, .affected]) | .[] | [.severity, .category, .finding, .affected, .recommendation])
 | @csv
 ' <<< 'null' > "$FINDINGS_CSV"
 
@@ -972,6 +1100,11 @@ echo "Stale users (>${STALE_DAYS}d):         $TOTAL_STALE"
 if [[ $SUBS_AVAILABLE -ne 1 ]]; then
     echo "NOTE: subscription data was unavailable; NextRenewalDate column is blank."
 fi
+if [[ $BILLING_AVAILABLE -eq 1 ]]; then
+    echo "Billing accounts:          $BILLING_ACCOUNT_COUNT (see BillingAccount column in the products CSV)"
+else
+    echo "NOTE: billing accounts were not readable; BillingAccount column says Unknown."
+fi
 if [[ $SIGNIN_AVAILABLE -ne 1 ]]; then
     echo "NOTE: signInActivity was unavailable; stale list uses created-date heuristic only."
 fi
@@ -979,7 +1112,7 @@ if [[ $SKIP_SECURITY -ne 1 ]]; then
     echo ""
     echo "-- Security review --"
     echo "Security defaults enabled: ${SECDEFAULTS_ENABLED:-unknown}"
-    echo "Global Administrators:     $GA_COUNT"
+    echo "Global Administrators:     $GA_COUNT$( (( GA_SP_COUNT > 0 )) && echo " (+${GA_SP_COUNT} service principals)" )"
     if [[ -n "$SECURESCORE_CURRENT" ]]; then
         echo "Secure Score:              ${SECURESCORE_CURRENT} / ${SECURESCORE_MAX}"
     fi
