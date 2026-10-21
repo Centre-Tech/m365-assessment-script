@@ -47,6 +47,7 @@ curl -s https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/
 | Flag | Default | Notes |
 | --- | --- | --- |
 | `--tenant ID\|DOMAIN`    | current session | Target tenant for the Graph token. Use when assessing a customer tenant via a partner (GDAP) account; run `az login --tenant <ID> --allow-no-subscriptions --use-device-code` first. If a GUID is given, the script aborts if Graph reports a different tenant. |
+| `--extended`             | off         | Adds a second device-code sign-in (Microsoft Graph Command Line Tools app) so Secure Score and risky users can be collected; the Cloud Shell Azure CLI token can't access them. The code prompt appears right after `Connected to:`; sign in once and the rest of the run is unattended. First use in a tenant needs a Global Admin to consent for the organization. |
 | `--stale-days N`         | `90`        | Inactivity threshold for the stale-users CSV. |
 | `--output-dir PATH`      | `$HOME`     | Where the CSVs / zip are written. |
 | `--skip-friendly-names`  | off         | Skip downloading Microsoft's SKU friendly-name map; CSV keeps raw `SkuPartNumber` values. |
@@ -58,7 +59,8 @@ curl -s https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/
 
 - Microsoft 365 admin center / Azure Cloud Shell **Bash** mode (already has `az`, `curl`, `jq`, `zip`, `python3`).
 - An account with at least **Global Reader** on the tenant.
-- The Azure CLI session in Cloud Shell already covers Graph delegated permissions via `Directory.AccessAsUser.All` — enough for users, products, and most of the security review (Conditional Access, admin roles, MFA registration, guests, legacy auth, OAuth consent, Secure Score).
+- The Azure CLI session in Cloud Shell already covers Graph delegated permissions via `Directory.AccessAsUser.All` — enough for users, products, and most of the security review (Conditional Access, admin roles, MFA registration, guests, legacy auth, OAuth consent).
+- Secure Score and risky users need `SecurityEvents.Read.All` / `IdentityRiskyUser.Read.All`, which the Azure CLI token never carries. Use `--extended` to collect them; without it those CSVs are header-only.
 - `signInActivity` on user rows, MFA registration details, and the legacy-auth scan require `AuditLog.Read.All` consent on the Azure CLI app. If it's not granted, those exports still produce successfully but the relevant columns/CSVs are blank, and the stale list falls back to a created-date heuristic.
 - Risky users (`M365_RiskyUsers_*.csv`) require an **Entra ID P2** license — on P1/free tenants the CSV is written with headers only.
 - Every security-review sub-check degrades gracefully: if the signed-in account lacks the Graph permission for it, the script prints a warning, writes a header-only CSV, and continues rather than aborting.
