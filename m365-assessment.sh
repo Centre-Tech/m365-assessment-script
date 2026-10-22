@@ -11,7 +11,7 @@
 #   ./m365-assessment.sh [--tenant ID|DOMAIN] [--extended] [--no-prompt] [--stale-days N] [--output-dir PATH] [--skip-friendly-names] [--no-download]
 #
 # One-liner (paste into Cloud Shell, Bash mode):
-#   curl -s https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/main/m365-assessment.sh | bash
+#   curl -s https://raw.githubusercontent.com/Centre-Tech/m365-assessment-script/main/m365-assessment.sh | bash
 
 set -euo pipefail
 

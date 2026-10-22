@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # diagnose.sh - report which Graph endpoints the Cloud Shell token can reach.
-# Usage: curl -s https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/<branch>/diagnose.sh | bash
+# Usage: curl -s https://raw.githubusercontent.com/Centre-Tech/m365-assessment-script/<branch>/diagnose.sh | bash
 
 T=$(az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv)
 python3 - "$T" <<'PY'
