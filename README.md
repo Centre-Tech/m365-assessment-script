@@ -16,8 +16,18 @@ curl -s https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/
 ```
 
 Cloud Shell pops the file-download dialog at the end with the zip
-pre-selected. No second sign-in (reuses your existing Azure CLI session),
-no module installs, no Conditional Access friction.
+pre-selected. No second sign-in by default (reuses your existing Azure CLI
+session), no module installs, no Conditional Access friction.
+
+Right after the `Connected to:` line, the script asks whether to run in
+**extended mode** (see `--extended` below). Answer `y` to do one extra
+device-code sign-in and collect Secure Score, risky users and the full E5 fit
+data. Press Enter, or wait 60 seconds, to continue in standard mode. To skip
+the question and go straight to the full run:
+
+```bash
+curl -s https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/main/m365-assessment.sh | bash -s -- --extended
+```
 
 Need different options? Pass arguments through:
 
@@ -50,6 +60,7 @@ curl -s https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/
 | --- | --- | --- |
 | `--tenant ID\|DOMAIN`    | current session | Target tenant for the Graph token. Use when assessing a customer tenant via a partner (GDAP) account; run `az login --tenant <ID> --allow-no-subscriptions --use-device-code` first. If a GUID is given, the script aborts if Graph reports a different tenant. |
 | `--extended`             | off         | Adds a second device-code sign-in (Microsoft Graph Command Line Tools app) for data the Cloud Shell Azure CLI token can't access: Secure Score, risky users, and for the E5 fit check, mailbox sizes, Teams phone numbers, PIM eligibility, eDiscovery custodians and Intune devices. The code prompt appears right after `Connected to:`; sign in once and the rest of the run is unattended. First use in a tenant (and after new permissions are added) needs a Global Admin to consent for the organization. |
+| `--no-prompt`            | off         | Don't ask about extended mode at startup; runs standard unless `--extended` is also passed. Use for scripted/unattended runs. The prompt is also skipped automatically when there's no terminal. |
 | `--stale-days N`         | `90`        | Inactivity threshold for the stale-users CSV. |
 | `--output-dir PATH`      | `$HOME`     | Where the CSVs / zip are written. |
 | `--skip-friendly-names`  | off         | Skip downloading Microsoft's SKU friendly-name map; CSV keeps raw `SkuPartNumber` values. |
