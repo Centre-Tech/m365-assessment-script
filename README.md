@@ -12,7 +12,7 @@ Open Cloud Shell in **Bash** mode (top-left "Switch to Bash" button if it's in
 PowerShell), then paste:
 
 ```bash
-curl -s https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/main/m365-assessment.sh | bash
+curl -s https://raw.githubusercontent.com/Centre-Tech/m365-assessment-script/main/m365-assessment.sh | bash
 ```
 
 Cloud Shell pops the file-download dialog at the end with the zip
@@ -26,13 +26,13 @@ data. Press Enter, or wait 60 seconds, to continue in standard mode. To skip
 the question and go straight to the full run:
 
 ```bash
-curl -s https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/main/m365-assessment.sh | bash -s -- --extended
+curl -s https://raw.githubusercontent.com/Centre-Tech/m365-assessment-script/main/m365-assessment.sh | bash -s -- --extended
 ```
 
 Need different options? Pass arguments through:
 
 ```bash
-curl -s https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/main/m365-assessment.sh | bash -s -- --stale-days 60
+curl -s https://raw.githubusercontent.com/Centre-Tech/m365-assessment-script/main/m365-assessment.sh | bash -s -- --stale-days 60
 ```
 
 ## What you get
@@ -87,7 +87,7 @@ curl -s https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/
 If a CSV comes back empty, run the diagnostic. It prints the signed-in identity, token scopes, and the HTTP status for each Graph and Billing endpoint the assessment uses:
 
 ```bash
-curl -s https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/main/diagnose.sh | bash
+curl -s https://raw.githubusercontent.com/Centre-Tech/m365-assessment-script/main/diagnose.sh | bash
 ```
 
 ## Running locally
@@ -95,7 +95,7 @@ curl -s https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/
 If you'd rather not pipe from `curl`:
 
 ```bash
-wget https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/main/m365-assessment.sh
+wget https://raw.githubusercontent.com/Centre-Tech/m365-assessment-script/main/m365-assessment.sh
 chmod +x m365-assessment.sh
 ./m365-assessment.sh --stale-days 90
 ```
