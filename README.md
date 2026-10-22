@@ -6,6 +6,11 @@ zip containing a full tenant inventory *and* a security review: Conditional
 Access, admin roles, MFA registration, guest access, legacy auth, OAuth app
 consent risk, Identity Protection risk signals, and Secure Score.
 
+> **Can't run the script?** [Easy Mode](easy-mode/README.md) walks a
+> customer through exporting the user list and the *Your products* list
+> (one per billing account) from the admin center by hand, with screenshots.
+> A Word version is in [`easy-mode/M365-Assessment-Easy-Mode.docx`](easy-mode/M365-Assessment-Easy-Mode.docx).
+
 ## Quick start (one line)
 
 Open Cloud Shell in **Bash** mode (top-left "Switch to Bash" button if it's in
