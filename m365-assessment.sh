@@ -8,7 +8,7 @@
 # the Cloud Shell download dialog.
 #
 # Usage:
-#   ./m365-assessment.sh [--tenant ID|DOMAIN] [--stale-days N] [--output-dir PATH] [--skip-friendly-names] [--no-download]
+#   ./m365-assessment.sh [--tenant ID|DOMAIN] [--extended] [--no-prompt] [--stale-days N] [--output-dir PATH] [--skip-friendly-names] [--no-download]
 #
 # One-liner (paste into Cloud Shell, Bash mode):
 #   curl -s https://raw.githubusercontent.com/arieldavenport/m365-assessment-script/main/m365-assessment.sh | bash
@@ -26,6 +26,8 @@ LEGACY_AUTH_DAYS=7
 TENANT=""
 MAX_RETRIES=6
 EXTENDED=0
+NO_PROMPT=0
+PROMPT_TIMEOUT=60
 
 usage() {
     cat <<EOF
@@ -33,7 +35,8 @@ Usage: $0 [options]
   --tenant ID|DOMAIN       Target tenant (default: the tenant of the current Azure CLI session)
   --extended               Second (device-code) sign-in to collect Secure Score and risky users,
                            which the Cloud Shell Azure CLI token can't access
-  --stale-days N           Stale account threshold in days (default 90)
+  --no-prompt              Don't ask whether to run extended mode; run standard unless --extended
+  --stale-days N            Stale account threshold in days (default 90)
   --output-dir PATH        Output directory (default: \$HOME)
   --skip-friendly-names    Skip downloading Microsoft's SKU friendly-name map
   --skip-e5-fit            Skip the per-user Microsoft 365 E5 -> Business Premium fit check
@@ -48,6 +51,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --tenant)              TENANT="$2"; shift 2 ;;
         --extended)            EXTENDED=1; shift ;;
+        --no-prompt)           NO_PROMPT=1; shift ;;
         --stale-days)          STALE_DAYS="$2"; shift 2 ;;
         --output-dir)          OUTPUT_DIR="$2"; shift 2 ;;
         --skip-friendly-names) SKIP_FRIENDLY=1; shift ;;
@@ -330,6 +334,24 @@ echo "Connected to: $TENANT_NAME  ($TENANT_ID)"
 if [[ "$TENANT" =~ ^[0-9a-fA-F-]{36}$ && "${TENANT,,}" != "${TENANT_ID,,}" ]]; then
     echo "ERROR: requested tenant $TENANT but Graph returned $TENANT_ID; aborting." >&2
     exit 1
+fi
+
+# Offer extended mode when it wasn't requested. Under `curl ... | bash` stdin
+# is the script itself, so the answer is read from the terminal (/dev/tty).
+# No terminal or no answer within the timeout means a standard run.
+if [[ $EXTENDED -ne 1 && $NO_PROMPT -ne 1 && $SKIP_SECURITY -ne 1 ]] && ( : </dev/tty ) 2>/dev/null; then
+    echo ""
+    echo "Run in extended mode? Adds one device-code sign-in (Global Admin) to collect"
+    echo "Secure Score, risky users, mailbox sizes, Teams numbers, PIM, eDiscovery and"
+    echo "Intune devices. The rest of the run stays unattended."
+    printf 'Extended mode [y/N] (standard in %ss): ' "$PROMPT_TIMEOUT"
+    ans=""
+    read -r -t "$PROMPT_TIMEOUT" ans </dev/tty || echo ""
+    if [[ "${ans,,}" =~ ^y(es)?$ ]]; then
+        EXTENDED=1
+    else
+        echo "Continuing in standard mode."
+    fi
 fi
 
 EXT_AVAILABLE=0
